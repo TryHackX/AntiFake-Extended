@@ -1304,6 +1304,29 @@ begin
   try Result := SaveInProgress; except Result := False; end;
 end;
 
+var
+  { the addresses whose place had a "?" and were asked about again since the library started }
+  GeoAskedAgain: TStringList = nil;
+
+{ A letter of a place that an older version lost is a "?" in it (before the letters were kept,
+  "Poland, ?wilcza"; on Linux the conversion itself wrote it). Such a place is asked about again
+  once per start of the library, not only after RefreshDays: a place that really has a sign
+  the console cannot show keeps its "?" and is not asked about over and over. Under GeoCritSec. }
+function GeoAskAgain(Idx: Integer; const SIP: string): Boolean;
+begin
+  Result := False;
+  if (Pos('?', string(GeoCache[Idx].City)) = 0) and (Pos('?', string(GeoCache[Idx].Region)) = 0) and
+     (Pos('?', string(GeoCache[Idx].Country)) = 0) then Exit;
+  if GeoAskedAgain = nil then
+  begin
+    GeoAskedAgain := TStringList.Create;
+    GeoAskedAgain.Sorted := True;
+  end;
+  if GeoAskedAgain.IndexOf(SIP) >= 0 then Exit;
+  GeoAskedAgain.Add(SIP);
+  Result := True;
+end;
+
 procedure Check_And_Update_Geo(IP: PChar); cdecl;
 var
   SIP: string;
@@ -1321,7 +1344,8 @@ begin
     try
       Idx := FindGeoIndex(SIP);
       if Idx = -1 then NeedsUpdate := True
-      else if (Now - GeoCache[Idx].LastUpdated) > Settings.GeoRefreshDays then NeedsUpdate := True;
+      else if (Now - GeoCache[Idx].LastUpdated) > Settings.GeoRefreshDays then NeedsUpdate := True
+      else if GeoAskAgain(Idx, SIP) then NeedsUpdate := True;
     finally
       LeaveCriticalSection(GeoCritSec);
     end;

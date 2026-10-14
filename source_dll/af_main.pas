@@ -153,6 +153,7 @@ finalization
   FreeAndNil(LogQueue);
   DoneCriticalSection(LogCS);
   FreeAndNil(BgThreads);
+  FreeAndNil(GeoAskedAgain);
   DoneCriticalSection(BgCS);
   FreeAndNil(LiveConns);
   DoneCriticalSection(OnlineCS);

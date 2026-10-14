@@ -770,7 +770,8 @@ together (delete `antifake.psb`); an old `settings.ini` works as it is, the new 
 - **Letters of places and Steam names:** the game console of Soldat 1.7.1 reads UTF-8, and a
   letter outside plain ASCII (`Swilcza` with its accent) was drawn as `?`. Every line now
   leaves the library as UTF-8, and with `MysqlCodepage = 1250` (the default) the Polish letters
-  of places and Steam names are kept.
+  of places and Steam names are kept. A place an older version kept with a `?` is looked up again
+  once per start, at the next join from its address.
 - **Geo:** an answer over 16 KB is refused, one lookup ends after twice `TimeoutMs`, a pause
   ip-api.com asks for is 5 minutes at most, and control characters of an answer (seen in the
   public "joined from" line) become spaces. Control characters of names are written as `?` in
