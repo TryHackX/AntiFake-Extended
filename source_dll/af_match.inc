@@ -166,6 +166,7 @@ begin
     { an answer that ends the waiting of the script: nothing is said about this join }
     TempStringResult := 'Unknown';
   end;
+  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;
 

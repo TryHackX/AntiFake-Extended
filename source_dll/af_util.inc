@@ -2,12 +2,88 @@
   AntiFake Extended - text, addresses and the small things everything else uses.
   --------------------------------------------------------------------------------------- }
 
+{ The code page of the text the library keeps and draws its tables in, one byte a letter: the
+  Central European one when the names of the players come in it (MysqlCodepage = 1250, every
+  Polish letter has its byte there), else the Western one. }
+function ConsoleCodepage: Integer;
+begin
+  if Settings.MysqlCodepage = 1250 then Result := 1250 else Result := 1252;
+end;
+
+{ A line on its way to the game console. Soldat 1.7.1 reads the console as UTF-8 (the client
+  and the server set their code page to UTF-8), and a byte above 127 on its own was drawn as
+  "?" ("Poland, ?wilcza"). A byte of ConsoleCodepage becomes its UTF-8; UTF-8 that is in the
+  line already (a name as the server gave it) stays as it is. }
+function ConsoleText(const S: string): string;
+var
+  i, n, Need, k: Integer;
+  B: Byte;
+  Valid, Plain: Boolean;
+begin
+  Plain := True;
+  for i := 1 to Length(S) do
+    if Byte(S[i]) >= $80 then
+    begin
+      Plain := False;
+      Break;
+    end;
+  if Plain then Exit(S);
+  Result := '';
+  n := Length(S);
+  i := 1;
+  while i <= n do
+  begin
+    B := Byte(S[i]);
+    if B < $80 then
+    begin
+      Result := Result + S[i];
+      Inc(i);
+      Continue;
+    end;
+    if (B and $E0) = $C0 then Need := 1
+    else if (B and $F0) = $E0 then Need := 2
+    else if (B and $F8) = $F0 then Need := 3
+    else Need := 0;
+    Valid := (Need > 0) and (i + Need <= n);
+    if Valid then
+      for k := 1 to Need do
+        if (Byte(S[i + k]) and $C0) <> $80 then Valid := False;
+    if Valid then
+    begin
+      Result := Result + Copy(S, i, Need + 1);
+      Inc(i, Need + 1);
+    end
+    else
+    begin
+      Result := Result + CodepageToUtf8(S[i], ConsoleCodepage);
+      Inc(i);
+    end;
+  end;
+end;
+
+{ The bytes of a text of fpjson (UTF-8) in a plain string, and of an answer in a UTF-8 string,
+  as they are. An assignment between strings of two code pages converts, and a letter the code
+  page of Windows (or of Linux without a locale) does not have became "?" on the way. }
+function Utf8Bytes(const U: UTF8String): string;
+begin
+  Result := '';
+  SetLength(Result, Length(U));
+  if Length(U) > 0 then Move(U[1], Result[1], Length(U));
+end;
+
+function AsUtf8(const S: RawByteString): UTF8String;
+begin
+  Result := '';
+  SetLength(Result, Length(S));
+  if Length(S) > 0 then Move(S[1], Result[1], Length(S));
+end;
+
 function Utf8ToConsole(const S: string): string;
 var
   i, Len, CP, Extra, Start: Integer;
   B: Byte;
   Broken: Boolean;
-  Out: string;
+  Out, Ch: string;
 begin
   Out := '';
   i := 1;
@@ -51,10 +127,20 @@ begin
       Continue;
     end;
     Inc(i);
+    { a letter the code page of the console has keeps its own byte (with 1250 the Polish ones;
+      ConsoleText makes it UTF-8 again on the way out) }
+    Ch := '';
+    if (CP >= $80) and (CP <> $A0) and not Settings.GeoTextPlain then
+    begin
+      Ch := Utf8ToCodepage(Copy(S, Start, i - Start), ConsoleCodepage);
+      if (Length(Ch) <> 1) or (Ch = '?') then Ch := '';
+    end;
     if CP = $A0 then
       { a no-break space is a space, in both kinds of text }
       Out := Out + ' '
-    else if Settings.GeoTextPlain and (CP >= $80) and (CP <= $17F) then
+    else if Ch <> '' then
+      Out := Out + Ch
+    else if (Settings.GeoTextPlain or (ConsoleCodepage <> 1252)) and (CP >= $80) and (CP <= $17F) then
     begin
       { only plain letters wanted: accents are dropped. The signs above U+017F take the
         common way below, which already writes them in plain text. }
@@ -119,13 +205,17 @@ begin
   Result := Out;
 end;
 
+{ The answer of the lookup comes over plain HTTP, and the country goes out to every player in
+  "joined from": a line break or another control character in it (JSON lets \n and \r through as such) is a space here, in the tables of the admins and in the database. }
 procedure SetGeoString(var Buffer: array of Char; const Value: string);
 var
-  Len: Integer;
+  Len, k: Integer;
   V: string;
 begin
   FillChar(Buffer, Length(Buffer), 0);
   V := Utf8ToConsole(Value);
+  for k := 1 to Length(V) do
+    if Ord(V[k]) < 32 then V[k] := ' ';
   Len := Length(V);
   if Len >= Length(Buffer) then Len := Length(Buffer) - 1;
   if Len > 0 then Move(V[1], Buffer, Len);
@@ -337,6 +427,24 @@ begin
     for k := NoticeList.Count - 1 downto 0 do
       if Copy(NoticeList[k], 1, Length(Prefix)) = Prefix then NoticeList.Delete(k);
   finally LeaveCriticalSection(NoticeCS); end;
+end;
+
+{ ---------------- data on the disk, not only in the system's cache ---------------- }
+
+{$IFDEF WINDOWS}
+function AfFlushFileBuffers(Handle: THandle): LongBool; stdcall; external 'kernel32.dll' name 'FlushFileBuffers';
+{$ENDIF}
+
+{ puts what was written through H on the disk before it returns. A file that takes another's
+  place by a rename must be whole on the disk first: the rename itself is written at once, and a
+  power cut right after it would leave the new name on blocks that were never written. }
+function SyncFileHandle(H: THandle): Boolean;
+begin
+  {$IFDEF WINDOWS}
+  Result := AfFlushFileBuffers(H);
+  {$ELSE}
+  Result := fpfsync(H) = 0;
+  {$ENDIF}
 end;
 
 { ---------------- a clock for short waits ---------------- }
@@ -817,6 +925,18 @@ begin
   finally Batch.Free; end;
 end;
 
+{ A log line holds no control characters: names and addresses of players come into it, and an
+  escape sequence of a terminal (ESC [ ...) in one of them moved the cursor and painted over the
+  lines before it for whoever read the log with cat or tail. The line end is added by the writer. }
+function LogSafe(const Line: string): string;
+var
+  k: Integer;
+begin
+  Result := Line;
+  for k := 1 to Length(Result) do
+    if Ord(Result[k]) < 32 then Result[k] := '?';
+end;
+
 procedure LogTo(const FileName, Line: string);
 var
   Start: Boolean;
@@ -827,7 +947,7 @@ begin
     if LogQueue = nil then LogQueue := TStringList.Create;
     { a runaway loop fills a little memory, never the disk }
     if LogQueue.Count < 10000 then
-      LogQueue.Add(FileName + #9 + FormatDateTime('yyyy-mm-dd hh:nn:ss', Now) + '  ' + Line);
+      LogQueue.Add(FileName + #9 + FormatDateTime('yyyy-mm-dd hh:nn:ss', Now) + '  ' + LogSafe(Line));
     if not LogWriting and not ShuttingDown then
     begin
       LogWriting := True;

@@ -151,15 +151,17 @@ begin
   Result := Utf8ToCodepage(S, Settings.MysqlCodepage);
 end;
 
-{ the location texts are kept in Windows-1252 (see Utf8ToConsole) }
+{ the location texts are kept in the code page of the console (see Utf8ToConsole) }
 function DbGeo(const S: string): string;
 begin
-  Result := CodepageToUtf8(S, 1252);
+  Result := CodepageToUtf8(S, ConsoleCodepage);
 end;
 
 function NewMysqlConnection: TMyConnection;
 begin
   Result := TMyConnection.Create;
+  { without TLS the password goes encrypted with this key, not with one the server sends }
+  Result.ServerPublicKey := Settings.MysqlServerKey;
   Result.Host := Settings.MysqlHost;
   Result.Port := Settings.MysqlPort;
   Result.Database := Settings.MysqlDatabase;
@@ -168,6 +170,9 @@ begin
   EnterCriticalSection(MirrorCS);
   try
     if LiveConns <> nil then LiveConns.Add(Result);
+    { Cleanup cuts the connections it finds once (AbortMysqlConnections, after ShuttingDown):
+      one made after that is cut at once, or it would wait out the time limit of its server }
+    if ShuttingDown then Result.Abort;
   finally LeaveCriticalSection(MirrorCS); end;
 end;
 
@@ -232,10 +237,22 @@ end;
   profile and builds strings, which takes a few microseconds. }
 procedure ProfileRows(i: Integer; const Sid, Stamp: string; Prof, Other, Visit, LSteam: TStrings);
 var
-  Kind, j: Integer;
+  Kind, j, m, Used: Integer;
   Arr: TBinaryOtherDataArray;
   Logins: Int64;
-  Head: string;
+  Head, Key: string;
+  Keys: array of string;
+  D: TDateTime;
+
+  function Taken(const K: string): Boolean;
+  var
+    t: Integer;
+  begin
+    Result := False;
+    for t := 0 to Used - 1 do
+      if Keys[t] = K then Exit(True);
+  end;
+
 begin
   Head := '(' + Sid + ', ' + IntToStr(i) + ', ';
   Logins := 0;
@@ -265,12 +282,30 @@ begin
         MyInt(Arr[j].IsActive) + ', ' + Stamp + ')');
     end;
   end;
+  Used := 0;
+  SetLength(Keys, Length(Profiles[i].Visits));
   for j := 0 to High(Profiles[i].Visits) do
     with Profiles[i].Visits[j] do
     begin
       { the start is the key of a visit; one without a real date cannot be stored }
-      if MyDate(Started) = 'NULL' then Continue;
-      Visit.Add(Head + MyDate(Started) + ', ' + MyInt(Seconds) + ', ' + MyStrMax(DbText(string(Name)), 64) + ', ' +
+      Key := MyDate(Started);
+      if Key = 'NULL' then Continue;
+      { The key holds whole seconds: a second visit of the account that started in the same second
+        took the place of the first, and a database read back from the copy had one visit less.
+        The later one goes in as many whole seconds later as it takes (the copy only; the file
+        keeps the real start). }
+      D := Started;
+      m := 0;
+      while Taken(Key) and (m < MAX_VISITS_HARD + 1) do
+      begin
+        Inc(m);
+        D := Started + m / 86400.0;
+        Key := MyDate(D);
+      end;
+      if (Key = 'NULL') or Taken(Key) then Continue;
+      Keys[Used] := Key;
+      Inc(Used);
+      Visit.Add(Head + Key + ', ' + MyInt(Seconds) + ', ' + MyStrMax(DbText(string(Name)), 64) + ', ' +
         MyStrMax(string(IP), 46) + ', ' + MyStrMax(DbText(string(Hwid)), 32) + ', ' +
         MyStrMax(string(CountryCode), 4) + ', ' + MyInt(Confidence) + ', ' + MyInt(Flags) + ', ' + Stamp + ')');
     end;

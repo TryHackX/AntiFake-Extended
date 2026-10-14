@@ -1,7 +1,7 @@
 unit Antifake;
 
 { =========================================================================================
-  AntiFake Extended System Advanced 2.0 - the script side.
+  AntiFake Extended System Advanced 2.1 - the script side.
 
   Everything that thinks is in antifake_dll: the profiles, the searching, the visits, the
   Steam lookups, the multi-account score, the storage and every table that is drawn.
@@ -160,17 +160,16 @@ external {$IFDEF WIN32} 'Log_Line@scripts/AntiFake-Extended/antifake_dll.dll cde
 implementation
 
 const
-  AF_VERSION = '2.0';
+  AF_VERSION = '2.1';
   INI_FILE = 'scripts/AntiFake-Extended/settings.ini';
   DB_FILE_CONST = 'nickreg/antifake.dat';
   CMD_PREFIX = '/';
   CONSOLE_SLOT = 33;
 
-  { what DLL_Run_Command answers }
+  { what DLL_Run_Command answers: 0 not a command of AntiFake, 2 a task that answers on a later
+    tick; anything else (3, refused or answered at once) has its lines in the buffer already }
   CMD_UNKNOWN = 0;
-  CMD_ANSWERED = 1;
   CMD_TASK = 2;
-  CMD_REFUSED = 3;
 
   KIND_NAME = 0;
   KIND_STEAM = 1;
@@ -221,9 +220,12 @@ var
   AnnounceLoad: Boolean;
 
   { a command is answered one tick after it was typed: writing to a player from inside the
-    chat event is what used to freeze the server }
+    chat event is what used to freeze the server. A second command typed in the same tick (a
+    bind, a macro) waits in the second place and runs a tick later. }
   PendingCmd: array[1..32] of string;
   PendingParams: array[1..32] of string;
+  PendingCmd2: array[1..32] of string;
+  PendingParams2: array[1..32] of string;
 
   { Soldat cannot take a whole table in one tick either, so the lines go out a few at a time }
   OutQueue: array[1..32] of TStringList;
@@ -243,7 +245,7 @@ var
   USE_GEODATA, PUBLIC_ENABLED, STEAM_ENABLED, MYSQL_ON, MULTI_NOTICE: Boolean;
   MYSQL_ENGINE: Integer;   { 0 = local: the file only, 1 = mirror: the file with a copy in MySQL, 2 = mysql: one database for every server }
   { the colours of [Colors] in settings.ini, the ones the library writes its own lines in }
-  COLOR_INFO, COLOR_WARN, COLOR_GOOD, COLOR_DATA: Integer;
+  COLOR_INFO, COLOR_WARN, COLOR_GOOD: Integer;
 
 { ---------------- talking to a player ---------------- }
 
@@ -536,11 +538,20 @@ begin
   end;
   { One command a tick. The /command of an admin comes through OnCommand and OnAdminCommand
     both: the server calls the one and then the other with the same text, in one go and before
-    any tick, so the first copy is waiting here and the second is dropped. The console comes
-    through OnAdminCommand alone (above), and a ! command through OnSpeak alone. }
-  if PendingCmd[Slot] <> '' then Exit;
-  PendingCmd[Slot] := Cmd;
-  PendingParams[Slot] := Params;
+    any tick, so the second copy of what is waiting is dropped. Another command of the same
+    tick (a ! command of ZitroStats and one of AntiFake from one bind) takes the second place;
+    a third one is dropped. The console comes through OnAdminCommand alone (above), and a !
+    command through OnSpeak alone. }
+  if PendingCmd[Slot] = '' then
+  begin
+    PendingCmd[Slot] := Cmd;
+    PendingParams[Slot] := Params;
+    Exit;
+  end;
+  if (PendingCmd[Slot] = Cmd) and (PendingParams[Slot] = Params) then Exit;
+  if PendingCmd2[Slot] <> '' then Exit;
+  PendingCmd2[Slot] := Cmd;
+  PendingParams2[Slot] := Params;
 end;
 
 { one command, handed to the library and answered from its buffer }
@@ -551,8 +562,10 @@ var
 begin
   Cmd := PendingCmd[Slot];
   Params := PendingParams[Slot];
-  PendingCmd[Slot] := '';
-  PendingParams[Slot] := '';
+  PendingCmd[Slot] := PendingCmd2[Slot];
+  PendingParams[Slot] := PendingParams2[Slot];
+  PendingCmd2[Slot] := '';
+  PendingParams2[Slot] := '';
   if Cmd = '' then Exit;
   if not Players[Slot].Active then Exit;
   Who := Players[Slot].Name;
@@ -609,20 +622,24 @@ end;
 
 procedure Event_OnSpeak(Player: TActivePlayer; Text: string);
 var
-  Cmd, Params: string;
+  Cmd, Params, S: string;
 begin
-  if Length(Text) < 2 then Exit;
-  if (Text[1] = '!') and PUBLIC_ENABLED then
+  { the server gives the team chat with a ^ in front: a ! command typed there counts the same }
+  S := Text;
+  if Length(S) > 1 then
+    if S[1] = '^' then Delete(S, 1, 1);
+  if Length(S) < 2 then Exit;
+  if (S[1] = '!') and PUBLIC_ENABLED then
   begin
-    SplitCommand(Copy(Text, 2, Length(Text)), Cmd, Params);
+    SplitCommand(Copy(S, 2, Length(S)), Cmd, Params);
     { the library hears that it was typed with the ! of the players: an admin who asks for
       !lastvisitors that way gets the list the players get }
     QueueCommand(Player, '!' + Cmd, Params);
     Exit;
   end;
-  if (Text[1] = CMD_PREFIX) and USE_ON_SPEAK_CMD then
+  if (S[1] = CMD_PREFIX) and USE_ON_SPEAK_CMD then
   begin
-    SplitCommand(Copy(Text, 2, Length(Text)), Cmd, Params);
+    SplitCommand(Copy(S, 2, Length(S)), Cmd, Params);
     QueueCommand(Player, Cmd, Params);
   end;
 end;
@@ -644,6 +661,10 @@ var
 begin
   Result := False;
   if Length(Command) < 2 then Exit;
+  { the server console and the remote admin come only this way (without a player), so they are
+    heard whatever AdminCommands says; AdminCommands = 0 leaves out the admins in the game }
+  if Player <> nil then
+    if not USE_ON_ADMIN_COMMAND then Exit;
   if Copy(Command, 1, 1) = CMD_PREFIX then Command := Copy(Command, 2, Length(Command));
   SplitCommand(Command, Cmd, Params);
   QueueCommand(Player, Cmd, Params);
@@ -714,6 +735,8 @@ begin
   PlayerNoticeFor[ID] := -1;
   PendingCmd[ID] := '';
   PendingParams[ID] := '';
+  PendingCmd2[ID] := '';
+  PendingParams2[ID] := '';
   OutDropped[ID] := 0;
   if OutQueue[ID] <> nil then OutQueue[ID].Clear;
   DLL_Clear_Task_Result(ID);
@@ -1072,7 +1095,6 @@ begin
   COLOR_INFO := ColorSetting('colorinfo', $87CEEB);
   COLOR_WARN := ColorSetting('colorwarning', $FFD700);
   COLOR_GOOD := ColorSetting('colorgood', $66CC66);
-  COLOR_DATA := ColorSetting('colordata', $C0C0C0);
   TimeUpdateSeconds := 60;
   if OUT_PER_TICK < 1 then OUT_PER_TICK := 4;
   if OUT_MAX_LINES < 20 then OUT_MAX_LINES := 200;
@@ -1098,7 +1120,7 @@ begin
   Game.OnSteamAuth := @WhenSteamLoginAuth;
   for i := 0 to 5 do
     Game.Teams[i].OnJoin := @TeamJoined;
-  if USE_ON_ADMIN_COMMAND then Game.OnAdminCommand := @Event_OnAdminCommand;
+  Game.OnAdminCommand := @Event_OnAdminCommand;
   for i := 1 to 32 do
   begin
     if USE_ON_SPEAK_CMD or PUBLIC_ENABLED then Players[i].OnSpeak := @Event_OnSpeak;
@@ -1130,6 +1152,8 @@ begin
     PlayerNoticeFor[i] := -1;
     PendingCmd[i] := '';
     PendingParams[i] := '';
+    PendingCmd2[i] := '';
+    PendingParams2[i] := '';
     OutDropped[i] := 0;
     OutQueue[i] := File.CreateStringList();
   end;
@@ -1165,12 +1189,29 @@ begin
     if not DLL_Journal_Final() then
       DLL_Start_Save_Binary(PChar(DB_FILE));
   DLL_Cleanup();
+  { the lists are not the server's: a /recompile would leave them behind }
+  for i := 1 to 32 do
+    if OutQueue[i] <> nil then
+    begin
+      OutQueue[i].Free;
+      OutQueue[i] := nil;
+    end;
 end;
 
 initialization
 begin
-  LoadSettings();
-  ScriptInit();
+  { a failure in one of these two must not keep the events and the database away: the script
+    would stay loaded and silent }
+  try
+    LoadSettings();
+  except
+    LogNote('the settings could not be read: ' + ExceptionToString(ExceptionType, ExceptionParam));
+  end;
+  try
+    ScriptInit();
+  except
+    LogNote('the start failed: ' + ExceptionToString(ExceptionType, ExceptionParam));
+  end;
   ScriptDecl();
   { the library reads the database on a thread of its own; with Engine = mirror it reads the
     newer of the copy in MySQL and the file, with Engine = mysql the database of every server.

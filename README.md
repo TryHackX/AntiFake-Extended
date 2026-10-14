@@ -1,4 +1,4 @@
-# AntiFake Extended System Advanced 2.0
+# AntiFake Extended System Advanced 2.1
 
 Who is who on a **Soldat Dedicated Server 2.8.2 (Soldat 1.7.1)**: accounts, names, computers,
 addresses, where people play from, what Steam says about them, and which accounts belong to the
@@ -24,6 +24,7 @@ and does not get in its way.
 11. [Every setting](#every-setting)
 12. [Building from source](#building-from-source)
 13. [Troubleshooting](#troubleshooting)
+14. [Changes in 2.1](#changes-in-21)
 
 ---
 
@@ -77,7 +78,10 @@ each for a limited time.
 
 When you update, `antifake.pas` and the library come from the same release: replace both
 together, and delete `antifake.psb` if there is one - that is the compiled script of the old
-version, and the server may run it instead of compiling the new `antifake.pas`.
+version, and the server may run it instead of compiling the new `antifake.pas`. On Linux
+`build.sh` puts the new library in under another name and renames it over the old one: a
+running server keeps the library it loaded and takes the new one at its next start or
+`/recompile`.
 
 The settings are in `settings.ini` next to the script. Every value has a built-in default, so a
 missing file or a missing line changes nothing. `Example-configs/` holds complete `settings.ini`
@@ -90,7 +94,7 @@ password that contains ` ;` itself goes in double quotes (`MysqlPassword` and `S
 lose them; any other value keeps quotes as they are). `SteamApiKey` belongs only in the
 server's own `settings.ini`; never publish it, or the file with it still in there.
 
-At start, the console gets a line like `version 2.0, settings read (N out of range, N
+At start, the console gets a line like `version 2.1, settings read (N out of range, N
 unknown)`: how many settings.ini lines were outside their range and kept their default, and
 how many were not recognised.
 
@@ -139,7 +143,7 @@ Every command that names an account also comes in three more forms, as in ZitroS
 | :-- | :-- |
 | `<command>id <slot>` | of the player in that server slot (`/online` shows the slots) |
 | `<command>p <row>` | in that row of the last list you got - the first column of a list numbers its rows |
-| `<command>i <position>` | of the player at that position of the ZitroStats ranking (`!top`), found here by the SteamID or else by the whole name; needs ZitroStats on the same server |
+| `<command>i <position>` | of the player at that position of the ZitroStats ranking (`!top`), found here by the SteamID, an account without Steam by its computer (ZitroStats 5.7 or newer), or else by the whole name - then a warning says it may be somebody else's account; needs ZitroStats on the same server |
 
 For example `/visitsid 3`, `/visitsp 2` after an `/af_search`, `/visitsi 1`, `/uniquevisitsi 5`,
 `/locationsp 4`, `/statusap 2`, `/privacyid n 5`, `/multip 1`. The words after the name stay
@@ -259,6 +263,14 @@ so `off` and `self` both mean admins only, and only `all` opens it to players - 
 without addresses or places, the same table an admin gets by typing `!lastvisitors` instead of
 `/lastvisitors`. Naming a player inside `!lastvisitors` still takes the reach of `PlayerVisits`.
 
+`!mystatus` and `!statusa` show the accounts tied to the one asked about - the closest of them
+and the list of accounts that share something with it - only to whom `PlayerMulti` lets ask
+`/multi` about that account: an admin, everybody with `all`, the player about their own account
+with `self`. An admin's list has the accounts with the same names too; a player's comes from the
+Steam accounts, computers and addresses only, so it costs the server one account, not all of
+them. With `PlayerMulti = off` (the default) a player's status says nothing about other
+accounts.
+
 **Addresses stay with the admins.** Whatever a player may ask, an address is shown whole only to
 an admin and to the player it belongs to; everybody else sees its first two numbers
 (`83.22.*.*`). A Steam account or a computer is shown whole the same way; everybody else sees
@@ -287,7 +299,7 @@ Every join is written into the account: when it started, how long it lasted, the
 computer, the address, the country, and how sure that location is. Joining and leaving in a
 loop does not make new rows: a visit from the same address is extended for
 `VisitCooldownMinutes` (10). An account keeps `VisitKeepCount` (50) visits, not older than
-`VisitKeepDays` (365).
+`VisitKeepDays` (365); `VisitKeepCount = 0` means the most an account can keep, 200.
 
 **How sure the location is**, 0-100, starts at 100 and loses:
 
@@ -329,7 +341,7 @@ SteamApiKey =                 ; empty = nothing is asked of Steam at all
 SteamRefreshDays = 7          ; an account already known is asked about again after this long
 SteamBatchSize = 25           ; how many in one request (Steam allows 100)
 SteamCurlPath = curl          ; the request goes through curl, which Windows 10 and Linux have
-SteamTimeoutSeconds = 10
+SteamTimeoutSeconds = 10       ; how long one request may take, 2-30 seconds
 ```
 
 A free key for your own server: https://steamcommunity.com/dev/apikey
@@ -400,7 +412,7 @@ Steam data and the admin decisions, next to the data of ZitroStats. On top of it
 - **While it loads.** Every command except `/antifake` (or `!antifake`) answers "The database
   is still being read; try again in a moment." until the database has been read.
 - **A `/recompile` while people are playing** tells the admins in the game, the console and the
-  log once the database has been read again: `AntiFake Extended 2.0: script compiled, database
+  log once the database has been read again: `AntiFake Extended 2.1: script compiled, database
   N accounts loaded in X ms` (or `..., but the database could not be read`).
 - **A journal.** Every `JournalSeconds` (10) whatever changed - logins, play time, visits, what
   Steam said - is appended to `nickreg/antifake.jrn`, so a server that is killed loses seconds instead
@@ -408,7 +420,10 @@ Steam data and the admin decisions, next to the data of ZitroStats. On top of it
   (UTC) of the file it belongs to, so a journal from another copy of the database is ignored,
   and a change to or from summer time never throws a good one away. A journal that has grown
   past 64 MB takes nothing more until the next full write. A new database (no file yet) is
-  written as soon as the script starts, so the journal works from the first minute.
+  written as soon as the script starts, so the journal works from the first minute. Every
+  record carries a checksum: a damaged record ends the replay there, and `/storage` says so.
+  A journal that could not be written (a full disk, a file held by another program) makes the
+  stop of the script write the whole database instead.
 - **A full write** every `SaveIntervalMinutes` (15) while something changed (players join, play
   or leave), and on `/storage save` (or `/storage now`): to a temporary file, then swapped in;
   the old file is kept as `.bak`. After that the journal starts again empty, with whatever
@@ -438,7 +453,14 @@ Steam data and the admin decisions, next to the data of ZitroStats. On top of it
   ever deleted**. The copy is read at the next start: restart the server. Until then nothing
   is written over it, so what happens on the server meanwhile is not kept. With
   `Engine = mysql` the file is only the cache and the next start reads the shared database.
-  A restore is refused while a full write is running; try again in a moment.
+  Only a copy that `/storage backups` lists is restored. A restore is refused while a full
+  write or a journal write is running, and no full write starts while it runs; try again in a
+  moment.
+- **The end of the script waits for nothing for long.** A question to Steam, a connection to
+  MySQL or a search still running are stopped. If a thread of AntiFake still runs after the
+  waits (a disk that hangs, a network that does not answer), the library stays loaded until
+  the server restarts - unloading it under a running thread would crash the server - and the
+  log says so; until that restart AntiFake answers only "The server is shutting down.".
 - **From the server folder to nickreg.** Older versions kept `antifake.dat` in the server
   folder. When `DatabaseFile` names a folder that has no database yet, the first start moves the
   old file there, with its journal, its `.bak`, its copies (and any `.replaced-<date>` files,
@@ -546,16 +568,24 @@ without `libmysql.dll` or `libmysqlclient.so`. It was tested against MySQL 8.4 a
 11.4: every table, every read of the mirror, the shared database, and the login methods servers
 use - `caching_sha2_password` (the MySQL 8 default, including the first login after a server
 start, when the password is sent encrypted with the server's RSA key) and
-`mysql_native_password`; `sha256_password` is spoken as well.
+`mysql_native_password`; `sha256_password` is spoken as well. That RSA key keeps the password
+from somebody on the way only when AntiFake has it already: `MysqlServerKey` names the
+server's `public_key.pem`; without it the server is asked for its key, and whoever answers in
+its place gets the password. A server key over 8192 bits, or with an exponent over 4 bytes, and
+an answer over 64 MB are refused.
 
 What it does not do: an encrypted (TLS) connection. A user created with `REQUIRE SSL`, or a
-server with `require_secure_transport = ON`, refuses the login, and `/storage` says so. MariaDB's
+server with `require_secure_transport = ON`, refuses the login, and `/storage` says so. The
+data (names, addresses, computers of the players) goes over the network as plain text: reach a
+database on another machine only through a VPN or an SSH tunnel. MariaDB's
 `ed25519` method is not supported either; give that user `mysql_native_password`.
 
 The text in the tables is UTF-8. Player names arrive in the code page of the players' Windows;
 `MysqlCodepage` says which (1250 for Central Europe, 1252 for Western Europe, 65001 for names
 that arrive as UTF-8; any other number reads them as Latin-1). Values are sent as hex
-literals, so no name a player chooses can change a statement.
+literals, so no name a player chooses can change a statement. With 1250 AntiFake also keeps
+the places and the Steam names in that code page, so their Polish and Czech letters show in the
+game; with any other value it keeps them in 1252 and writes such a letter as a plain one.
 
 **Several servers with `Engine = mirror`, more to search.** Servers that share one database
 (each with its own `MysqlServerId` and `Engine = mirror`, so its copy is there) can look into
@@ -608,7 +638,7 @@ Write all six digits: `FFF` is read as `000FFF`, a dark blue.
 | :-- | :-- |
 | `[General]` | the database file and how often it is written |
 | `[Storage]` | the journal, the copies and how many are kept |
-| `[Commands]` | which events the script listens to, the flood limits, lines per tick |
+| `[Commands]` | which events the script listens to (`AdminCommands = 0` leaves out the admins in the game; the server console and the remote admin always work), the flood limits, lines per tick (1-10) |
 | `[PlayerCommands]` | what a player may ask with `!` |
 | `[Colors]` | the colours of everything AntiFake writes |
 | `[Diagnostics]` | the trace (`logs/antifake/trace.log`) |
@@ -647,7 +677,15 @@ reads the packages from that folder whatever `fpc.cfg` says.
 
 The scripts compile into `source_dll/build/` and copy only the finished library next to the
 script. The MySQL part is always in it and needs nothing else on the server. `clean.bat` /
-`clean.sh` remove `build/`.
+`clean.sh` remove `build/`. On Linux the new library goes in under a temporary name and is
+renamed over the old one, so a running server keeps the library it loaded (a copy written over
+it would change its code under the server and crash it) and takes the new one at its next start
+or `/recompile`. `PIC=1 sh build.sh` builds position independent code, for a system with SELinux
+or PaX that refuses a library with relocations in its code (`TEXTREL`).
+
+On Linux an error inside the library's own code (a signal such as `SIGSEGV`) is not caught by
+its error handling the way Windows catches it: it ends the server. Please report one with the
+last lines of `logs/antifake/trace.log` (`[Diagnostics] Trace = 1`).
 
 The programs in `source_dll/tests` test the library without a game server: `aftest`,
 `afstress`, `afconv`, `aflint` and `afexamples` on their own, `afmysql` (the mirror) and
@@ -695,3 +733,55 @@ closest match (`/multi`) that would not fit is shortened with `...` instead. A l
 still be wider - a long place, provider or host name - is cut at 98 characters and ends in
 `..`. One answer is `MaxQueuedLines` (200) lines at most; a longer one ends with a line that
 says it was cut there. Lower `ResultsPerPage` if the pages are too long.
+
+---
+
+## Changes in 2.1
+
+Fixes of a full audit of the script and the library. `antifake.pas` and the library go
+together (delete `antifake.psb`); an old `settings.ini` works as it is, the new key
+(`MysqlServerKey`) is optional. The database file of 2.0 is read as it is.
+
+- **`/recompile` and the end of the server** never hang or crash the server any more: a
+  question to Steam or a MySQL connection still running is stopped at once, and the library
+  never waits for a thread while Windows unloads it. If a thread still runs after the waits, the
+  library stays loaded until the server restarts (the log says so).
+- **`VisitKeepCount = 0`** means the most an account keeps (200); it used to let an account keep
+  more, and the next start then lost every account, Steam answer and admin decision behind it.
+  A file or journal written that way by 2.0 is read whole now.
+- **Privacy:** `!mystatus` and `!statusa` show the accounts tied to the one asked about only to
+  whom `PlayerMulti` lets ask `/multi` about it (by default only the admins); a player saw the
+  accounts of strangers who played from the same school or cafe address. A player's status also
+  no longer walks every account of the database.
+- **The journal** carries a checksum per record (format 2; a 2.0 journal is still replayed); a
+  record that is damaged or names an account far beyond the others ends the replay there. A
+  journal that could not be written makes the stop of the script write the whole database.
+  Going back to 2.0: `/storage save` first, or the changes since the last full write are lost.
+- **Files:** the new file, every copy and the `.shared` file are on the disk before they take the
+  place of the old one (a power cut right after a write no longer leaves a broken file); a copy
+  that does not fit on the disk is not counted as made; `/storage restore` takes only a copy that
+  `/storage backups` lists and nothing writes over it while it runs.
+- **Engine = mysql:** one exchange sends 200 accounts at most (the rest go in the next ones),
+  so the other servers no longer wait on a long one; the `.shared` file is written whole by one
+  writer at a time.
+- **MySQL:** `MysqlServerKey` (the server's RSA public key) keeps the password from somebody
+  on the way; limits on the key and on the size of an answer. The mirror keeps two visits of one
+  account from the same second as two rows.
+- **Letters of places and Steam names:** the game console of Soldat 1.7.1 reads UTF-8, and a
+  letter outside plain ASCII (`Swilcza` with its accent) was drawn as `?`. Every line now
+  leaves the library as UTF-8, and with `MysqlCodepage = 1250` (the default) the Polish letters
+  of places and Steam names are kept.
+- **Geo:** an answer over 16 KB is refused, one lookup ends after twice `TimeoutMs`, a pause
+  ip-api.com asks for is 5 minutes at most, and control characters of an answer (seen in the
+  public "joined from" line) become spaces. Control characters of names are written as `?` in
+  `logs/antifake`.
+- **Commands:** a second command typed in the same tick (a bind with a command of ZitroStats
+  and one of AntiFake) is no longer lost; `!` commands work in the team chat as well;
+  `AdminCommands = 0` no longer turns off the server console and the remote admin;
+  `<command>i <position>` finds an account without Steam by its computer (ZitroStats 5.7) and
+  says so when it found one by the name only.
+- **Settings:** `LinesPerTick` 1-10 (it allowed 30, and many lines to one player in one tick can
+  stop the server), `SteamTimeoutSeconds` 2-30.
+- **Linux:** `build.sh` no longer copies over the library of a running server (that crashed it):
+  the new one is renamed in and used from the next start or `/recompile`; `PIC=1 sh build.sh` for
+  systems with SELinux.

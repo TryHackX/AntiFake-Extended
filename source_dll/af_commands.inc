@@ -8,10 +8,12 @@
 
 const
   CMD_PREFIX = '/';
-  { what Run_Command tells the script }
+  { what a command comes to. Run_Command tells the script CMD_UNKNOWN, CMD_TASK or CMD_REFUSED:
+    a command it takes runs on a worker, and its lines (CMD_ANSWERED there) reach the buffer
+    the way the answer of a search does }
   CMD_UNKNOWN = 0;      { not one of ours }
-  CMD_ANSWERED = 1;     { the lines are waiting in the buffer }
-  CMD_TASK = 2;         { a search was started; the answer comes when it is done }
+  CMD_ANSWERED = 1;     { the lines are waiting in the buffer (DispatchCommand only) }
+  CMD_TASK = 2;         { taken: the answer comes on a later tick }
   CMD_REFUSED = 3;      { not allowed, or too soon after the last one - the buffer says why }
 
 var
@@ -1051,8 +1053,9 @@ begin
 end;
 {$ENDIF}
 
-{ the account at a position of the ZitroStats ranking (its !top): name and SteamID }
-function ZitroRankAccount(Rank: Integer; out Name, Steam, Why: string): Boolean;
+{ the account at a position of the ZitroStats ranking (its !top): name, SteamID and, from
+  ZitroStats 5.7 on (API 17), the computer it knows the account by }
+function ZitroRankAccount(Rank: Integer; out Name, Steam, Hwid, Why: string): Boolean;
 type
   TTopCopy = function(Rank: LongInt; Buf: PChar; Size: LongInt): LongInt; cdecl;
 var
@@ -1065,6 +1068,7 @@ begin
   Result := False;
   Name := '';
   Steam := '';
+  Hwid := '';
   Why := '';
   n := 0;
   Path := ZitroLibraryPath;
@@ -1080,7 +1084,10 @@ begin
     Exit;
   end;
   try
-    F := TTopCopy(GetProcedureAddress(H, 'ZS_API_Top_Player_Copy'));
+    { Name, tab, SteamID, tab, computer; an older ZitroStats has only the first two fields }
+    F := TTopCopy(GetProcedureAddress(H, 'ZS_API_Top_Player_Copy2'));
+    if not Assigned(F) then
+      F := TTopCopy(GetProcedureAddress(H, 'ZS_API_Top_Player_Copy'));
     if not Assigned(F) then
     begin
       Why := 'This ZitroStats is too old to be asked for its ranking.';
@@ -1099,19 +1106,32 @@ begin
   q := Pos(#9, S);
   if q = 0 then q := Length(S) + 1;
   Name := Copy(S, 1, q - 1);
-  Steam := Trim(Copy(S, q + 1, Length(S)));
+  S := Copy(S, q + 1, Length(S));
+  { the computer goes up to the next tab: a later API may add fields behind it }
+  q := Pos(#9, S);
+  if q > 0 then
+  begin
+    Hwid := Copy(S, q + 1, Length(S));
+    S := Copy(S, 1, q - 1);
+    q := Pos(#9, Hwid);
+    if q > 0 then Hwid := Copy(Hwid, 1, q - 1);
+    Hwid := Trim(Hwid);
+  end;
+  Steam := Trim(S);
+  if Steam = '0' then Steam := '';
   Result := Name <> '';
   if not Result then
     Why := 'Nobody is at position ' + IntToStr(Rank) + ' of the ZitroStats ranking.';
 end;
 
 { "^3" among the words (from <command>i 3): the account here of the player at position 3 of
-  the ZitroStats ranking, by the SteamID or else by the whole name. On a worker. }
+  the ZitroStats ranking, by the SteamID, else by the computer (an account without Steam), else
+  by the whole name - then Why says so while the result is True. On a worker. }
 function RankTargets(var P: string; var Why: string): Boolean;
 var
   W: TStringList;
-  i, Rank, Acc: Integer;
-  Name, Steam: string;
+  i, j, Rank, Acc, First: Integer;
+  Name, Steam, Hwid: string;
 begin
   Result := True;
   Why := '';
@@ -1124,7 +1144,7 @@ begin
       if (Length(W[i]) < 3) or (Copy(W[i], 1, 2) <> FORM_MARK + '^') then Continue;
       Rank := StrToIntDef(Copy(W[i], 3, Length(W[i])), -1);
       if Rank < 1 then Continue;
-      if not ZitroRankAccount(Rank, Name, Steam, Why) then
+      if not ZitroRankAccount(Rank, Name, Steam, Hwid, Why) then
       begin
         Result := False;
         Exit;
@@ -1139,7 +1159,35 @@ begin
           if (Acc < 0) and (SteamToId64(Steam) <> '') then Acc := ProfileOfId64(SteamToId64(Steam));
         finally UnlockProfiles; end;
       end;
-      if Acc < 0 then Acc := AccountNamed(Name);
+      if (Acc < 0) and (Steam = '') and (Hwid <> '') then
+      begin
+        { the accounts of that computer here: the one with this name, else the first of them
+          (a name of its own is no proof, the computer is) }
+        LockProfiles;
+        try
+          j := IndexFirst(HwidIndex, Hwid);
+          First := -1;
+          while (j >= 0) and (j < HwidIndex.Count) and (HwidIndex[j] = Hwid) do
+          begin
+            Acc := Integer(PtrInt(HwidIndex.Objects[j]));
+            if (Acc >= 0) and (Acc < ProfileCount) then
+            begin
+              if First < 0 then First := Acc;
+              if SameText(GetProfileActiveName(Acc), Trim(Name)) then Break;
+            end;
+            Acc := -1;
+            Inc(j);
+          end;
+          if Acc < 0 then Acc := First;
+        finally UnlockProfiles; end;
+      end;
+      if Acc < 0 then
+      begin
+        Acc := AccountNamed(Name);
+        if Acc >= 0 then
+          Why := Name + ' (position ' + IntToStr(Rank) + ' of the ZitroStats ranking) was found by the name only: ' +
+            'the account may be somebody else''s.';
+      end;
       if Acc < 0 then
       begin
         Why := Name + ' (position ' + IntToStr(Rank) + ' of the ZitroStats ranking) has no account here.';

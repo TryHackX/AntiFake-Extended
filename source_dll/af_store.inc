@@ -4,29 +4,38 @@
 
 { ---------------- copies that are kept ---------------- }
 
-{ a plain copy, in pieces, so a big database does not want a big block of memory }
+{ A plain copy, in pieces, so a big database does not want a big block of memory. A write that
+  fails (a full disk) raises instead of returning 0: the copy is then False and the piece of it
+  is deleted - a short copy used to count as made, and the rotation threw an older good one
+  away for it. The copy is on the disk when this returns. }
 function CopyFileTo(const Source, Dest: string): Boolean;
 var
   Src, Dst: TFileStream;
   Buf: array[0..65535] of Byte;
   n: Integer;
+  Made: Boolean;
 begin
   Result := False;
+  Made := False;
   try
     Src := TFileStream.Create(Source, fmOpenRead or fmShareDenyNone);
     try
       Dst := TFileStream.Create(Dest, fmCreate);
+      Made := True;
       try
         repeat
           n := Src.Read(Buf, SizeOf(Buf));
-          if n > 0 then Dst.Write(Buf, n);
+          if n > 0 then Dst.WriteBuffer(Buf, n);
         until n <= 0;
+        SyncFileHandle(Dst.Handle);
       finally Dst.Free; end;
     finally Src.Free; end;
     Result := True;
   except
     Result := False;
   end;
+  if Made and not Result then
+    try DeleteFile(Dest); except end;
 end;
 
 { ---------------- one file in place of another ---------------- }
@@ -38,9 +47,27 @@ function AfCreateHardLink(NewName, Existing: PWideChar; Security: Pointer): Long
   external 'kernel32.dll' name 'CreateHardLinkW';
 {$ENDIF}
 
+{$IFDEF UNIX}
+{ a rename is an entry of the folder: on Linux it is on the disk once the folder is }
+procedure SyncFolderOf(const Path: string);
+var
+  Dir: string;
+  Fd: LongInt;
+begin
+  Dir := ExtractFileDir(Path);
+  if Dir = '' then Dir := '.';
+  Fd := FpOpen(PChar(Dir), O_RDONLY);
+  if Fd >= 0 then
+  begin
+    fpfsync(Fd);
+    FpClose(Fd);
+  end;
+end;
+{$ENDIF}
+
 { Src takes the place of Dst in one step, whether Dst is there or not: there is no moment
   without either of them. A file that somebody holds open for a moment (a virus scanner, a copy
-  being made) gets a few more tries. }
+  being made) gets a few more tries. Src has to be on the disk already (SyncFileHandle). }
 function ReplaceFileAtomic(const Src, Dst: string): Boolean;
 var
   Round: Integer;
@@ -53,6 +80,7 @@ begin
     Result := AfMoveFileEx(PWideChar(UnicodeString(Src)), PWideChar(UnicodeString(Dst)), 1 or 8);
     {$ELSE}
     Result := FpRename(PChar(Src), PChar(Dst)) = 0;
+    if Result then SyncFolderOf(Dst);
     {$ENDIF}
     if Result or (Round = 5) then Exit;
     Sleep(100);
@@ -226,6 +254,65 @@ begin
   finally LeaveCriticalSection(JournalCS); end;
 end;
 
+const
+  { Format 2 of the journal: every record carries a checksum behind it (JournalRecordSum), so a
+    damaged record ends the replay instead of being put into the accounts. A journal of format 1
+    (JOURNAL_FORMAT, AntiFake 2.0) has none and is replayed as before. }
+  JOURNAL_FORMAT_SUM = 2;
+  { a new account of the journal comes right after the ones before it; one this far beyond
+    them is a damaged record (it used to make the list that long, up to 5 million accounts) }
+  JOURNAL_MAX_JUMP = 1000;
+
+var
+  { An append to the journal failed since the last full write (a full disk, a file that is
+    gone): the journal misses changes. Journal_Final then says False and Cleanup writes the
+    whole database. A new journal after a full write starts without it. Belongs to JournalCS. }
+  JournalWriteFailed: Boolean = False;
+  { an admin puts a copy in place of the database right now (Restore_Backup): no full write
+    may start (StartSave). Belongs to JournalCS. }
+  RestoreRunning: Boolean = False;
+
+{ LoadedPath for a thread that did not write it: the load and the save thread replace it, and
+  a string read while it is replaced may already be freed }
+function CurrentDbPath: string;
+begin
+  EnterCriticalSection(JournalCS);
+  try
+    Result := LoadedPath;
+  finally LeaveCriticalSection(JournalCS); end;
+end;
+
+procedure SetLoadedPath(const DbPath: string);
+begin
+  EnterCriticalSection(JournalCS);
+  try
+    LoadedPath := DbPath;
+  finally LeaveCriticalSection(JournalCS); end;
+end;
+
+function JournalRecordSum(Kind: Byte; Len: LongInt; const Data: AnsiString): Cardinal;
+begin
+  Result := crc32(0, nil, 0);
+  Result := crc32(Result, @Kind, 1);
+  Result := crc32(Result, @Len, SizeOf(Len));
+  if Len > 0 then Result := crc32(Result, @Data[1], Len);
+end;
+
+{ one record of the journal as it is written: kind, length, the bytes, the checksum }
+function JournalRecord(Kind: Byte; const Data: AnsiString): AnsiString;
+var
+  Len: LongInt;
+  Sum: Cardinal;
+begin
+  Len := Length(Data);
+  Sum := JournalRecordSum(Kind, Len, Data);
+  SetLength(Result, 1 + SizeOf(Len) + Len + SizeOf(Sum));
+  Result[1] := AnsiChar(Kind);
+  Move(Len, Result[2], SizeOf(Len));
+  if Len > 0 then Move(Data[1], Result[2 + SizeOf(Len)], Len);
+  Move(Sum, Result[2 + SizeOf(Len) + Len], SizeOf(Sum));
+end;
+
 { which database this journal belongs to: its size and the moment it was written, in UTC
   (see FileTimeUtc), and the local time a journal written by an older version holds }
 function SnapshotStamp(const DbPath: string; var Size: Int64; var TimeUtc, TimeLocal: Double): Boolean;
@@ -275,22 +362,44 @@ begin
     Sleep(5);
   until GetTickCount64 >= Deadline;
   try
-    JournalPath := JournalNameFor(DbPath);
-    LoadedPath := DbPath;
+    { the paths are read by other threads (CurrentDbPath, Journal_Flush): replaced under the lock }
+    SetLoadedPath(DbPath);
+    if not Mine then
+    begin
+      { a write of the journal that holds it this long would collide with a new file; the
+        journal stays off until the next full write starts it again, and the end of the server
+        writes the whole database (Journal_Final finds no journal) }
+      EnterCriticalSection(JournalCS);
+      try
+        JournalPath := '';
+      finally LeaveCriticalSection(JournalCS); end;
+      SetJournalError('the journal was busy for 10 s after a full write and was not started again; ' +
+        'it starts with the next full write');
+      Exit;
+    end;
+    EnterCriticalSection(JournalCS);
+    try
+      JournalPath := JournalNameFor(DbPath);
+    finally LeaveCriticalSection(JournalCS); end;
     JournalBytes := 0;
     if not SnapshotStamp(DbPath, Size, TimeUtc, TimeLocal) then Exit;
     try
-      F := TFileStream.Create(JournalPath, fmCreate);
+      F := TFileStream.Create(JournalNameFor(DbPath), fmCreate);
       try
         FillChar(H, SizeOf(H), 0);
         H.Magic := JOURNAL_MAGIC;
-        H.Format := JOURNAL_FORMAT;
+        H.Format := JOURNAL_FORMAT_SUM;
         H.SnapSize := Size;
         H.SnapTime := TimeUtc;
         H.Written := NowUtc;
-        F.Write(H, SizeOf(H));
+        F.WriteBuffer(H, SizeOf(H));
         JournalBytes := SizeOf(H);
       finally F.Free; end;
+      { everything up to here is in the file the journal belongs to }
+      EnterCriticalSection(JournalCS);
+      try
+        JournalWriteFailed := False;
+      finally LeaveCriticalSection(JournalCS); end;
     except
       on E: Exception do SetJournalError(E.Message);
     end;
@@ -319,7 +428,7 @@ const
   PER_HOLD = 64;
 var
   Rec: AnsiString;
-  i, n, Len, Kind: Integer;
+  i, n, Len: Integer;
   Out: TMemoryStream;
   More: Boolean;
 begin
@@ -361,11 +470,8 @@ begin
             Rec := PackProfile(i);
             if Rec <> '' then
             begin
-              Kind := JREC_PROFILE;
-              Len := Length(Rec);
-              Out.Write(Kind, 1);
-              Out.Write(Len, SizeOf(Len));
-              Out.Write(Rec[1], Len);
+              Rec := JournalRecord(JREC_PROFILE, Rec);
+              Out.Write(Rec[1], Length(Rec));
             end;
           end;
           Inc(i);
@@ -381,10 +487,8 @@ begin
             SetLength(Rec, Len);
             for i := 0 to VerdictCount - 1 do
               Move(Verdicts[i], Rec[i * SizeOf(TPairVerdict) + 1], SizeOf(TPairVerdict));
-            Kind := JREC_VERDICTS;
-            Out.Write(Kind, 1);
-            Out.Write(Len, SizeOf(Len));
-            if Len > 0 then Out.Write(Rec[1], Len);
+            Rec := JournalRecord(JREC_VERDICTS, Rec);
+            Out.Write(Rec[1], Length(Rec));
           end;
         end;
       finally UnlockProfiles; end;
@@ -423,29 +527,46 @@ end;
 procedure TJournalThread.Execute;
 var
   F: TFileStream;
-  Ok: Boolean;
+  Ok, Failed: Boolean;
 begin
   GuardWorkerThread;
+  Failed := False;
   try
     if FPack then
     begin
       FData := PackJournal(2000, Ok);
       Inc(JournalBytes, Length(FData));
     end;
-    if (FData <> '') and FileExists(FPath) then
+    if FData <> '' then
     begin
-      F := TFileStream.Create(FPath, fmOpenWrite or fmShareDenyWrite);
-      try
-        F.Seek(0, soEnd);
-        F.Write(FData[1], Length(FData));
-      finally F.Free; end;
-      Inc(JournalWrites);
+      { what was packed has lost its marks: if it cannot be written, only a full write keeps it }
+      if not FileExists(FPath) then
+      begin
+        Failed := True;
+        SetJournalError('the journal file ' + FPath + ' is gone; the next full write starts a new one');
+      end
+      else
+      begin
+        F := TFileStream.Create(FPath, fmOpenWrite or fmShareDenyWrite);
+        try
+          F.Seek(0, soEnd);
+          { raises when the disk takes less than all of it, where Write said nothing }
+          F.WriteBuffer(FData[1], Length(FData));
+        finally F.Free; end;
+        Inc(JournalWrites);
+      end;
     end;
   except
-    on E: Exception do SetJournalError(E.Message);
+    on E: Exception do
+    begin
+      { what was packed (or half packed) lost its marks either way }
+      Failed := True;
+      SetJournalError(E.Message);
+    end;
   end;
   EnterCriticalSection(JournalCS);
   try
+    if Failed then JournalWriteFailed := True;
     JournalBusy := False;
   finally LeaveCriticalSection(JournalCS); end;
 end;
@@ -453,23 +574,31 @@ end;
 { The script calls this every few seconds. The game thread only starts the thread; the thread
   packs what changed and appends it. }
 procedure Journal_Flush(); cdecl;
+var
+  Path: string;
 begin
-  if ShuttingDown or LoadError or (JournalPath = '') then Exit;
-  if JournalBytes > MAX_JOURNAL_BYTES then Exit;
-  if not GrabLock(JournalCS, 5) then Exit;
   try
-    if JournalBusy then Exit;
-    { read without the lock of the profiles: a mark set a moment later goes with the next call }
-    if (DirtyCount = 0) and not VerdictsDirty then Exit;
-    JournalBusy := True;
-  finally LeaveCriticalSection(JournalCS); end;
-  try
-    StartBackground(TJournalThread.Create('', JournalPath, True));
-  except
-    EnterCriticalSection(JournalCS);
+    if ShuttingDown or LoadError then Exit;
+    if JournalBytes > MAX_JOURNAL_BYTES then Exit;
+    if not GrabLock(JournalCS, 5) then Exit;
     try
-      JournalBusy := False;
+      { the path is taken under the lock: the load and the save thread replace it }
+      Path := JournalPath;
+      if (Path = '') or JournalBusy then Exit;
+      { read without the lock of the profiles: a mark set a moment later goes with the next call }
+      if (DirtyCount = 0) and not VerdictsDirty then Exit;
+      JournalBusy := True;
     finally LeaveCriticalSection(JournalCS); end;
+    try
+      StartBackground(TJournalThread.Create('', Path, True));
+    except
+      EnterCriticalSection(JournalCS);
+      try
+        JournalBusy := False;
+      finally LeaveCriticalSection(JournalCS); end;
+    end;
+  except
+    ExportFailed('Journal_Flush');
   end;
 end;
 
@@ -484,50 +613,64 @@ end;
 { The script stops (a /recompile or the end of the server). True when everything that changed
   since the last full write is on its way to the journal - Cleanup waits for the journal
   thread, and the next start puts the journal on top of the file - so no full write is needed.
-  False when there is no journal, it is full, or not everything could be taken: then the script
-  writes the whole database. }
+  False when there is no journal, it is full, an earlier append failed, or not everything could
+  be taken: then the script writes the whole database. Should this last append fail, Cleanup
+  sees it (JournalWriteFailed) and writes the whole database itself. }
 function Journal_Final(): Boolean; cdecl;
 var
   T0: QWord;
   Buf: AnsiString;
-  Ok, Mine: Boolean;
+  Path: string;
+  Ok, Mine, Started, Failed: Boolean;
 begin
   Result := False;
-  if ShuttingDown or LoadError or (JournalPath = '') or (Settings.JournalSeconds <= 0) then Exit;
-  if not LoadComplete or LoadInProgress then Exit;
-  if JournalBytes > MAX_JOURNAL_BYTES then Exit;
-  { a journal thread that runs goes first }
   Mine := False;
-  T0 := GetTickCount64;
-  repeat
-    EnterCriticalSection(JournalCS);
+  Started := False;
+  try
     try
-      if not JournalBusy then
+      if ShuttingDown or LoadError or (Settings.JournalSeconds <= 0) then Exit;
+      if not LoadComplete or LoadInProgress then Exit;
+      if JournalBytes > MAX_JOURNAL_BYTES then Exit;
+      { a journal thread that runs goes first }
+      T0 := GetTickCount64;
+      repeat
+        EnterCriticalSection(JournalCS);
+        try
+          Path := JournalPath;
+          Failed := JournalWriteFailed;
+          if (Path <> '') and not Failed and not JournalBusy then
+          begin
+            JournalBusy := True;
+            Mine := True;
+          end;
+        finally LeaveCriticalSection(JournalCS); end;
+        if Mine or (Path = '') or Failed then Break;
+        Sleep(1);
+      until GetTickCount64 - T0 >= 3000;
+      if not Mine then Exit;
+      Buf := PackJournal(500, Ok);
+      Inc(JournalBytes, Length(Buf));
+      StartBackground(TJournalThread.Create(Buf, Path, False));
+      Started := True;
+      if not Ok then Exit;
+      if not GrabProfiles(500) then Exit;
+      try
+        Result := (DirtyCount = 0) and not VerdictsDirty;
+      finally UnlockProfiles; end;
+    finally
+      { the journal is free again when no thread took it over }
+      if Mine and not Started then
       begin
-        JournalBusy := True;
-        Mine := True;
+        EnterCriticalSection(JournalCS);
+        try
+          JournalBusy := False;
+        finally LeaveCriticalSection(JournalCS); end;
       end;
-    finally LeaveCriticalSection(JournalCS); end;
-    if Mine then Break;
-    Sleep(1);
-  until GetTickCount64 - T0 >= 3000;
-  if not Mine then Exit;
-  Buf := PackJournal(500, Ok);
-  Inc(JournalBytes, Length(Buf));
-  try
-    StartBackground(TJournalThread.Create(Buf, JournalPath, False));
+    end;
   except
-    EnterCriticalSection(JournalCS);
-    try
-      JournalBusy := False;
-    finally LeaveCriticalSection(JournalCS); end;
-    Exit;
+    ExportFailed('Journal_Final');
+    Result := False;
   end;
-  if not Ok then Exit;
-  if not GrabProfiles(500) then Exit;
-  try
-    Result := (DirtyCount = 0) and not VerdictsDirty;
-  finally UnlockProfiles; end;
 end;
 
 { After the database is read, whatever the journal holds is put on top of it: those are the
@@ -548,6 +691,8 @@ var
   Data: AnsiString;
   P: TProfileData;
   Path: string;
+  HasSum: Boolean;
+  Sum: Cardinal;
 begin
   Result := 0;
   Path := JournalNameFor(DbPath);
@@ -558,7 +703,9 @@ begin
     try
       if F.Size < SizeOf(H) then Exit;
       F.Read(H, SizeOf(H));
-      if (H.Magic <> JOURNAL_MAGIC) or (H.Format <> JOURNAL_FORMAT) then Exit;
+      if (H.Magic <> JOURNAL_MAGIC) or
+         ((H.Format <> JOURNAL_FORMAT) and (H.Format <> JOURNAL_FORMAT_SUM)) then Exit;
+      HasSum := H.Format = JOURNAL_FORMAT_SUM;
       { a journal written for another copy of the database says nothing about this one. The
         time is in UTC; a journal of an older version holds the local time instead. }
       if H.SnapSize <> Size then Exit;
@@ -567,13 +714,29 @@ begin
       begin
         F.Read(Kind, 1);
         F.Read(Len, SizeOf(Len));
-        if (Len < 0) or (F.Position + Len > F.Size) then Break;
+        if (Len < 0) or (F.Position + Len + Ord(HasSum) * SizeOf(Sum) > F.Size) then Break;
         SetLength(Data, Len);
         if Len > 0 then
           if F.Read(Data[1], Len) <> Len then Break;
+        if HasSum then
+        begin
+          if (F.Read(Sum, SizeOf(Sum)) <> SizeOf(Sum)) then Break;
+          if Sum <> JournalRecordSum(Kind, Len, Data) then
+          begin
+            SetJournalError('a record of the journal is damaged (its checksum is wrong); ' +
+              'what came after it was not replayed');
+            Break;
+          end;
+        end;
         if Kind = JREC_PROFILE then
         begin
           if not UnpackProfile(Data, Idx, P) then Break;
+          if Idx > FreshCount + JOURNAL_MAX_JUMP then
+          begin
+            SetJournalError('a record of the journal names account #' + IntToStr(Idx) + ', far beyond the ' +
+              IntToStr(FreshCount) + ' there are; it and what came after it were not replayed');
+            Break;
+          end;
           if Idx >= 0 then
           begin
             { a profile that was made after the last full write is not in the file at all,
@@ -632,14 +795,18 @@ var
   R: string;
 begin
   R := '';
-  Files := ListBackupFiles(LoadedPath);
   try
-    for i := 0 to Files.Count - 1 do
-    begin
-      if R <> '' then R := R + '|';
-      R := R + Files[i];
-    end;
-  finally Files.Free; end;
+    Files := ListBackupFiles(CurrentDbPath);
+    try
+      for i := 0 to Files.Count - 1 do
+      begin
+        if R <> '' then R := R + '|';
+        R := R + Files[i];
+      end;
+    finally Files.Free; end;
+  except
+    ExportFailed('Get_Backup_List');
+  end;
   TempStringResult := R;
   Result := PChar(TempStringResult);
 end;
@@ -648,31 +815,65 @@ end;
   be restarted to read it. The file that was there is never deleted, only moved aside - and its
   journal with it (it used to be deleted, and the changes it held since the last full write of
   that file were lost). The copy is made under a name of its own first, so a copy that fails
-  half way never leaves the server without its file. Not while a full write runs: that write
-  would put the memory over the copy a moment later. }
+  half way never leaves the server without its file. Only a copy of the list (ListBackupFiles):
+  the folder is shared with ZitroStats, whose files are no database of AntiFake. Not while a
+  full write or an append to the journal runs, and none of them starts until it is done
+  (RestoreRunning, the journal taken): they would put the memory over the copy a moment later. }
 function Restore_Backup(Name: PChar): Boolean; cdecl;
 var
-  Src, Aside, Tmp: string;
+  Db, Wanted, Src, Aside, Tmp: string;
+  Files: TStringList;
+  k: Integer;
+  Mine: Boolean;
 begin
   Result := False;
-  if (LoadedPath = '') or SaveInProgress then Exit;
-  if ExtractFileName(string(Name)) = '' then Exit;
-  Src := BackupDirFor(LoadedPath) + PathDelim + ExtractFileName(string(Name));
-  if not FileExists(Src) then Exit;
-  Tmp := LoadedPath + '.restoring';
-  Aside := LoadedPath + '.replaced-' + FormatDateTime('yyyymmdd-hhnnss', Now);
+  Mine := False;
   try
-    if not CopyFileTo(Src, Tmp) then Exit;
-    if FileExists(LoadedPath) then
-      if not RenameFile(LoadedPath, Aside) then Exit;
-    Result := ReplaceFileAtomic(Tmp, LoadedPath);
-    if not Result then
-    begin
-      { the one that was there goes back }
-      if FileExists(Aside) and not FileExists(LoadedPath) then RenameFile(Aside, LoadedPath);
-      Exit;
+    Db := CurrentDbPath;
+    if Db = '' then Exit;
+    Wanted := ExtractFileName(string(Name));
+    if Wanted = '' then Exit;
+    Files := ListBackupFiles(Db);
+    try
+      k := Files.IndexOf(Wanted);
+      if k < 0 then Exit;
+      Wanted := Files[k];
+    finally Files.Free; end;
+    Src := BackupDirFor(Db) + PathDelim + Wanted;
+    if not FileExists(Src) then Exit;
+    EnterCriticalSection(JournalCS);
+    try
+      if not RestoreRunning and not JournalBusy and not SaveInProgress then
+      begin
+        RestoreRunning := True;
+        JournalBusy := True;
+        Mine := True;
+      end;
+    finally LeaveCriticalSection(JournalCS); end;
+    if not Mine then Exit;
+    try
+      Tmp := Db + '.restoring';
+      Aside := Db + '.replaced-' + FormatDateTime('yyyymmdd-hhnnss', Now);
+      if not CopyFileTo(Src, Tmp) then Exit;
+      if FileExists(Db) then
+        if not RenameFile(Db, Aside) then Exit;
+      Result := ReplaceFileAtomic(Tmp, Db);
+      if not Result then
+      begin
+        { the one that was there goes back }
+        if FileExists(Aside) and not FileExists(Db) then RenameFile(Aside, Db);
+        Exit;
+      end;
+      if FileExists(JournalNameFor(Db)) then RenameFile(JournalNameFor(Db), Aside + '.jrn');
+      { from now on nothing is written over the copy: set before a full write may start again }
+      LoadError := True;
+    finally
+      EnterCriticalSection(JournalCS);
+      try
+        RestoreRunning := False;
+        JournalBusy := False;
+      finally LeaveCriticalSection(JournalCS); end;
     end;
-    if FileExists(JournalNameFor(LoadedPath)) then RenameFile(JournalNameFor(LoadedPath), Aside + '.jrn');
   except
     Result := False;
   end;

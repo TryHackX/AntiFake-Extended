@@ -1138,6 +1138,7 @@ begin
     ExportFailed('Get_Maintenance_Report');
     TempStringResult := '';
   end;
+  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;
 
@@ -1154,6 +1155,8 @@ var
   write the empty memory over the file, and the next start would read that. After a load that
   failed, what is in memory is not the database either. }
 function StartSave(const FilePath: string; Asker, Session: Integer): Boolean;
+var
+  Restoring: Boolean;
 begin
   Result := False;
   if SaveInProgress then
@@ -1164,8 +1167,16 @@ begin
   end;
   if LoadError then begin SaveError := True; SaveComplete := True; Exit; end;
   if not LoadComplete or LoadInProgress then Exit;
+  { an admin puts a copy in place of the file right now (Restore_Backup): this write would put
+    the memory over it. Taken under the lock the restore takes, so one of the two waits. }
+  EnterCriticalSection(JournalCS);
+  try
+    Restoring := RestoreRunning;
+    if not Restoring then SaveInProgress := True;
+  finally LeaveCriticalSection(JournalCS); end;
+  if Restoring then begin SaveError := True; SaveComplete := True; Exit; end;
   SaveAgain := False;
-  SaveInProgress := True; SaveComplete := False; SaveError := False;
+  SaveComplete := False; SaveError := False;
   try
     { the last write has finished its work (SaveInProgress went down at its end): this waits
       for the few lines of it that are left }
@@ -1245,6 +1256,7 @@ begin
     ExportFailed('Notice_Line');
     TempStringResult := '';
   end;
+  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;
 
@@ -1263,6 +1275,7 @@ begin
     ExportFailed('Get_Load_Note');
     TempStringResult := '';
   end;
+  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;
 
@@ -1454,15 +1467,74 @@ begin
   if Result then T.WaitFor;
 end;
 
-{ The script calls this when it stops, the library once more when it is unloaded. The order
-  matters: no new search may start (ShuttingDown), the connections to MySQL are cut so nothing
-  waits for a database, the searches are told to stop, then every background thread - the
-  commands first among them, which may still be starting a search - is waited for, and the
-  searches are collected last. Every wait has an end, and one step that fails does not stop
-  the others. }
+const
+  GET_MODULE_HANDLE_EX_FLAG_PIN = 1;
+  GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 4;
+{$IFNDEF WINDOWS}
+  RTLD_NOW_FLAG = 2;
+  RTLD_NODELETE_FLAG = $1000;
+{$ENDIF}
+
+var
+  { the script has called Cleanup: the unload of the library does not do it again }
+  CleanupCalled: Boolean = False;
+  LibraryPinned: Boolean = False;
+
+{$IFDEF WINDOWS}
+function AfGetModuleHandleEx(Flags: LongWord; Addr: Pointer; out Module: THandle): LongBool; stdcall;
+  external 'kernel32.dll' name 'GetModuleHandleExW';
+{$ELSE}
+type
+  TAfDlInfo = record
+    dli_fname: PAnsiChar;
+    dli_fbase: Pointer;
+    dli_sname: PAnsiChar;
+    dli_saddr: Pointer;
+  end;
+
+function af_dladdr(Addr: Pointer; var Info: TAfDlInfo): LongInt; cdecl; external 'dl' name 'dladdr';
+function af_dlopen(Name: PAnsiChar; Flags: LongInt): Pointer; cdecl; external 'dl' name 'dlopen';
+{$ENDIF}
+
+{ Keeps the library in the process for good: the server unloads it after the script has
+  stopped, and a thread of it that is still running would then run on in code that is gone and
+  bring the server down. BasicExtended and ZitroStats do the same from the start; AntiFake only
+  when a thread is left over. }
+function PinLibrary: Boolean;
+{$IFDEF WINDOWS}
+var
+  H: THandle;
+begin
+  H := 0;
+  if not LibraryPinned then
+    LibraryPinned := AfGetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_PIN or GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+      @PinLibrary, H);
+  Result := LibraryPinned;
+end;
+{$ELSE}
+var
+  Info: TAfDlInfo;
+begin
+  if not LibraryPinned then
+  begin
+    FillChar(Info, SizeOf(Info), 0);
+    if (af_dladdr(@PinLibrary, Info) <> 0) and (Info.dli_fname <> nil) then
+      LibraryPinned := af_dlopen(Info.dli_fname, RTLD_NOW_FLAG or RTLD_NODELETE_FLAG) <> nil;
+  end;
+  Result := LibraryPinned;
+end;
+{$ENDIF}
+
+{ The script calls this when it stops (CleanupCalled); the unload of the library does not call
+  it again. The order matters: no new search may start (ShuttingDown), the connections to MySQL
+  are cut so nothing waits for a database, the searches are told to stop, then every background
+  thread - the commands first among them, which may still be starting a search - is waited for,
+  and the searches are collected last. Every wait has an end, and one step that fails does not
+  stop the others. A thread that still runs at the end keeps the library loaded (pinned): the
+  server unloads it right after, and that must not happen under a running thread. }
 procedure Cleanup(); cdecl;
 var
-  i: Integer;
+  i, Left: Integer;
   T: TThread;
   Deadline: QWord;
   Again, Running: Boolean;
@@ -1490,6 +1562,7 @@ var
   end;
 
 begin
+  CleanupCalled := True;
   { Engine = mysql: the last exchange, while the connections are still there }
   try SharedStop; except ExportFailed('Cleanup (the last exchange)'); end;
   ShuttingDown := True;
@@ -1521,7 +1594,13 @@ begin
         if ThreadEnded(T, Int64(Deadline) - Int64(GetTickCount64)) then
           T.Free
         else
+        begin
           LogEvent('the search of slot ' + IntToStr(i) + ' did not stop in time and was left running');
+          { kept, so the end below knows it still runs (no new search can take the slot now) }
+          EnterCriticalSection(Contexts[i].Lock);
+          Contexts[i].Thread := TSearchThread(T);
+          LeaveCriticalSection(Contexts[i].Lock);
+        end;
       end;
     end;
   except
@@ -1563,8 +1642,16 @@ begin
         LockProfiles;
         try Again := DirtyCount > MarkedBefore; finally UnlockProfiles; end;
       end;
+      { an append to the journal failed since the last full write - Journal_Final's own among
+        them, which nobody waited for: the journal misses changes, the file has to take them }
+      if not Again then
+      begin
+        EnterCriticalSection(JournalCS);
+        try Again := JournalWriteFailed; finally LeaveCriticalSection(JournalCS); end;
+        if Again then LogEvent('the journal could not take every change; the whole database is written instead');
+      end;
       SaveAgain := False;
-      if SaveAgainPath = '' then SaveAgainPath := LoadedPath;
+      if SaveAgainPath = '' then SaveAgainPath := CurrentDbPath;
       if Again and (SaveAgainPath <> '') then
         if StartSave(SaveAgainPath, 0, 0) then WaitForSave;
     end;
@@ -1572,6 +1659,66 @@ begin
     ExportFailed('Cleanup (the full write)');
   end;
   { a search may have asked for a location on its way out }
-  try WaitBackground(3 * Settings.GeoTimeoutMs); except end;
+  Left := 0;
+  try Left := WaitBackground(3 * Settings.GeoTimeoutMs); except end;
+  { What still runs now would run on in a library the server unloads in a moment: the unload
+    waits for nothing, and the code is gone under the thread. Whatever has ended since is
+    collected; for the rest the library stays in the process until the server ends. }
+  try
+    for i := 1 to MAX_SLOTS do
+    begin
+      EnterCriticalSection(Contexts[i].Lock);
+      T := Contexts[i].Thread;
+      LeaveCriticalSection(Contexts[i].Lock);
+      if T = nil then Continue;
+      if ThreadEnded(T, 0) then
+      begin
+        EnterCriticalSection(Contexts[i].Lock);
+        Contexts[i].Thread := nil;
+        LeaveCriticalSection(Contexts[i].Lock);
+        T.Free;
+      end
+      else
+        Inc(Left);
+    end;
+    if LoadThread <> nil then
+      if ThreadEnded(LoadThread, 0) then FreeAndNil(LoadThread) else Inc(Left);
+    if SaveThread <> nil then
+      if ThreadEnded(SaveThread, 0) then FreeAndNil(SaveThread) else Inc(Left);
+    if Left > 0 then
+    begin
+      if PinLibrary then
+        LogEvent(IntToStr(Left) + ' thread(s) of AntiFake were still running when the script stopped: ' +
+          'the library stays loaded so they cannot bring the server down, and AntiFake works again ' +
+          'after a restart of the server')
+      else
+        LogEvent(IntToStr(Left) + ' thread(s) of AntiFake were still running when the script stopped, ' +
+          'and the library could not be kept loaded: restart the server');
+    end;
+  except
+    ExportFailed('Cleanup (the threads left running)');
+  end;
+  try LogFlush; except end;
+end;
+
+{ What the unload of the library may still do. It runs under the lock of the system's loader:
+  a thread that ends needs that lock to end, so a wait for one there never returns. Nothing is
+  waited for here; the script's Cleanup did the waiting, and a library with a thread left over
+  was pinned by it and stays until the process ends (when every thread has been ended already).
+  Without a Cleanup of the script (a test program that just ends) the threads are only told to
+  stop. }
+procedure CleanupAtUnload;
+var
+  i: Integer;
+begin
+  if CleanupCalled then Exit;
+  ShuttingDown := True;
+  try
+    for i := 1 to MAX_SLOTS do
+      if Contexts[i].Thread <> nil then Contexts[i].Thread.Terminate;
+    if LoadThread <> nil then LoadThread.Terminate;
+    if SaveThread <> nil then SaveThread.Terminate;
+  except
+  end;
   try LogFlush; except end;
 end;

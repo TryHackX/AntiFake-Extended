@@ -18,6 +18,8 @@ var
   Found: Boolean;
   CheckStr, MatchedStr: string;
   FoundProfiles, TargetNames, TargetSteams, TargetHWIDs, TargetIPs: TStringList;
+  KeyLists, KeyIndexes: array[0..2] of TStringList;
+  KeyPos: Integer;
   TaskIsValid: Boolean;
   HasMatch, HasNameMatch: Boolean;
   TempNameCount: Integer;
@@ -877,6 +879,45 @@ begin
                       for j := 0 to Length(Profiles[FTask.TargetIndex].OtherIPs) - 1 do TargetIPs.Add(GetOtherDataString(Profiles[FTask.TargetIndex].OtherIPs[j]));
                    finally UnlockProfiles; end;
 
+                   if FTask.Kind = STATUS_TIES_KEYS then
+                   begin
+                      { a player: the accounts behind the Steam accounts, computers and addresses of
+                        this one come from the indexes, and names are not compared - the work of
+                        one account instead of a walk through all of them }
+                      KeyLists[0] := TargetSteams; KeyIndexes[0] := SteamIndex;
+                      KeyLists[1] := TargetHWIDs; KeyIndexes[1] := HwidIndex;
+                      KeyLists[2] := TargetIPs; KeyIndexes[2] := IpIndex;
+                      LockProfiles;
+                      try
+                         for k := 0 to 2 do
+                            for j := 0 to KeyLists[k].Count - 1 do
+                            begin
+                               KeyPos := IndexFirst(KeyIndexes[k], KeyLists[k][j]);
+                               while (KeyPos >= 0) and (KeyPos < KeyIndexes[k].Count) and
+                                     (KeyIndexes[k][KeyPos] = KeyLists[k][j]) do
+                               begin
+                                  c := Integer(PtrInt(KeyIndexes[k].Objects[KeyPos]));
+                                  if (c >= 0) and (c < ProfileCount) and (c <> FTask.TargetIndex) then
+                                     FoundProfiles.Add(Format('%.9d', [c]));
+                                  Inc(KeyPos);
+                               end;
+                            end;
+                         { FoundProfiles is sorted: the accounts come in their order, as in the walk }
+                         for j := 0 to FoundProfiles.Count - 1 do
+                         begin
+                            c := StrToInt(FoundProfiles[j]);
+                            Room;
+                            TempResults[TempCount].ProfileIndex := c;
+                            TempResults[TempCount].ActiveName := GetProfileActiveName(c);
+                            TempResults[TempCount].DataString := GetProfileActiveName(c);
+                            TempResults[TempCount].TimePlayed := Profiles[c].Profile.TimePlayed;
+                            TempResults[TempCount].MatchType := 1;
+                            Inc(TempCount);
+                         end;
+                      finally UnlockProfiles; end;
+                   end;
+
+                   if FTask.Kind = STATUS_TIES_ALL then
                    for c := 0 to MaxIdx do begin
                       if c = FTask.TargetIndex then Continue;
                       if Terminated then Break;
@@ -1593,7 +1634,7 @@ begin
             if Settings.SharedLinks and (FTask.Kind >= KIND_NAME) and (FTask.Kind <= KIND_IP) then
               ForeignLinks(FTask.TargetIndex, 1 shl FTask.Kind, ForeignRows, ForeignWhy);
           TASK_STATUSA:
-            if Settings.SharedLinks then
+            if Settings.SharedLinks and (FTask.Kind <> STATUS_TIES_NONE) then
               ForeignLinks(FTask.TargetIndex, FOREIGN_TIES, ForeignRows, ForeignWhy);
         end;
 
@@ -1736,7 +1777,7 @@ begin
   JournalReplayed := 0;
   { the script prints the note after the load, and keeps it in the log }
   MoveNote := MoveOldDatabase(FFilePath);
-  LoadedPath := FFilePath;
+  SetLoadedPath(FFilePath);
   try
     { Engine = mirror: the copy in the tables is read when it is newer than the file. The file
       is then written from it at once, so the two agree again; the one that was there is kept
@@ -1805,8 +1846,9 @@ begin
             if not GrabBytes(FS, FreshGeo[i], SizeOf(TGeoEntry)) then begin GeoN := i; Break; end;
         end;
       { after the locations the file holds a list of sections, each behind its own magic
-        word: a file written before them simply has none, an unknown word ends the reading,
-        and a damaged tail costs only what that section held. }
+        word: a file written before them simply has none, and an unknown word ends the
+        reading. A damaged section ends it as well: the sections carry no length, so the ones
+        after it cannot be found and are lost with it. }
       TailOk := Ok;
       while TailOk and (FS.Size - FS.Position >= SizeOf(Cardinal)) do
       begin
@@ -1818,7 +1860,10 @@ begin
           for i := 0 to Count - 1 do
           begin
             if not GrabBytes(FS, VCount, SizeOf(VCount)) then begin TailOk := False; Break; end;
-            if (VCount < 0) or (VCount > MAX_VISITS_HARD) or
+            { an account with more visits than it may keep (VisitKeepCount = 0 wrote them all
+              in 2.0) is read whole and keeps the newest: refusing it ended the reading of the
+              visits of every account after it, and of the Steam and the decisions sections }
+            if (VCount < 0) or (VCount > MAX_VISITS_READ) or
                (Int64(VCount) * SizeOf(TVisitEntry) > FS.Size - FS.Position) then
             begin TailOk := False; Break; end;
             SetLength(Fresh[i].Visits, VCount);
@@ -1829,6 +1874,8 @@ begin
                 TailOk := False;
                 Break;
               end;
+            if not TailOk then Break;
+            KeepNewestVisits(Fresh[i].Visits, MAX_VISITS_HARD);
           end;
         end
         else if Magic = STEAM_MAGIC then
@@ -2162,7 +2209,9 @@ begin
         for i := 0 to VCount - 1 do Chunk.WriteBuffer(Verdicts[i], SizeOf(TPairVerdict));
       finally UnlockProfiles; end;
       Spill(True);
-
+      { on the disk before it takes the place of the file: a power cut right after the rename
+        left the new name on blocks that were never written }
+      if not Terminated then SyncFileHandle(FS.Handle);
     finally FS.Free; end;
     { a write that was stopped half way is no database: it stays in the .tmp and says so }
     if Terminated then Failed := True
@@ -2249,12 +2298,18 @@ end;
 
 function Is_Task_Complete(PlayerID: Integer): Boolean; cdecl;
 begin
-  if (PlayerID < 1) or (PlayerID > MAX_SLOTS) then Exit(False);
-  EnterCriticalSection(Contexts[PlayerID].Lock);
+  Result := False;
   try
-    Result := Contexts[PlayerID].IsComplete;
-  finally
-    LeaveCriticalSection(Contexts[PlayerID].Lock);
+    if (PlayerID < 1) or (PlayerID > MAX_SLOTS) then Exit;
+    EnterCriticalSection(Contexts[PlayerID].Lock);
+    try
+      Result := Contexts[PlayerID].IsComplete;
+    finally
+      LeaveCriticalSection(Contexts[PlayerID].Lock);
+    end;
+  except
+    ExportFailed('Is_Task_Complete');
+    Result := False;
   end;
 end;
 
@@ -2269,25 +2324,54 @@ begin
   end;
 end;
 
+var
+  { what Select_Task_Result took: a copy of the slot's result, made under the slot's lock }
+  SelectedResult: TSearchResult;
+
+{ Select_Task_Result and the Get_Result_* below are not used by the script (it draws the tables
+  in the library, af_views.inc); they are kept for the test programs and for tools. The result
+  is copied under the slot's lock: a search that ends (or a player who leaves) replaces it while
+  the Get_Result_* read it, and the count could say more rows than the list had yet. }
 procedure Select_Task_Result(PlayerID: Integer); cdecl;
 begin
-  if (PlayerID < 1) or (PlayerID > MAX_SLOTS) then ActiveResult := @EmptyResult
-  else ActiveResult := @Contexts[PlayerID].Result;
+  try
+    if (PlayerID < 1) or (PlayerID > MAX_SLOTS) then
+    begin
+      ActiveResult := @EmptyResult;
+      Exit;
+    end;
+    EnterCriticalSection(Contexts[PlayerID].Lock);
+    try
+      SelectedResult := Contexts[PlayerID].Result;
+    finally
+      LeaveCriticalSection(Contexts[PlayerID].Lock);
+    end;
+    if SelectedResult.ResultCount > Length(SelectedResult.Results) then
+      SelectedResult.ResultCount := Length(SelectedResult.Results);
+    ActiveResult := @SelectedResult;
+  except
+    ExportFailed('Select_Task_Result');
+    ActiveResult := @EmptyResult;
+  end;
 end;
 
 procedure Clear_Task_Result(PlayerID: Integer); cdecl;
 begin
-  if (PlayerID < 1) or (PlayerID > MAX_SLOTS) then Exit;
-  EnterCriticalSection(Contexts[PlayerID].Lock);
   try
-    { a search still running keeps its answer to itself (see TPlayerContext.Gen) }
-    Inc(Contexts[PlayerID].Gen);
-    Contexts[PlayerID].IsComplete := False;
-    Contexts[PlayerID].IsBusy := False;
-    Contexts[PlayerID].Result.ResultCount := 0;
-    SetLength(Contexts[PlayerID].Result.Results, 0);
-  finally
-    LeaveCriticalSection(Contexts[PlayerID].Lock);
+    if (PlayerID < 1) or (PlayerID > MAX_SLOTS) then Exit;
+    EnterCriticalSection(Contexts[PlayerID].Lock);
+    try
+      { a search still running keeps its answer to itself (see TPlayerContext.Gen) }
+      Inc(Contexts[PlayerID].Gen);
+      Contexts[PlayerID].IsComplete := False;
+      Contexts[PlayerID].IsBusy := False;
+      Contexts[PlayerID].Result.ResultCount := 0;
+      SetLength(Contexts[PlayerID].Result.Results, 0);
+    finally
+      LeaveCriticalSection(Contexts[PlayerID].Lock);
+    end;
+  except
+    ExportFailed('Clear_Task_Result');
   end;
 end;
 

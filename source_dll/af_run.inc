@@ -380,7 +380,7 @@ function DispatchCommand(Slot: Integer; const Cmd, Params, Who: string;
   IsAdmin, Chat: Boolean): Integer;
 var
   C, P, Why, Word1, Rest: string;
-  Idx, Kind, Sort, q, k: Integer;
+  Idx, Kind, Sort, q, k, Ties: Integer;
   W: TStringList;
   Desc, Known: Boolean;
 begin
@@ -431,6 +431,8 @@ begin
       Say(Slot, CLR_WARN, Why);
       Exit;
     end;
+    { taken by the name only }
+    if Why <> '' then Say(Slot, CLR_WARN, Why);
   end;
 
   { ---- what somebody is ---- }
@@ -466,7 +468,14 @@ begin
       Say(Slot, CLR_WARN, Why);
       Exit;
     end;
-    Result := StartTaskFor(Slot, TASK_STATUSA, 0, 0, Idx, 0, '', False, False,
+    { the ties of an account are what /multi says: PlayerMulti decides who sees them, not
+      PlayerStatus (a player saw the accounts of strangers from the same school address) }
+    if IsAdmin then Ties := STATUS_TIES_ALL
+    else if (Settings.CmdMulti = 2) or ((Settings.CmdMulti = 1) and (Idx = OnlineProfileOf(Slot))) then
+      Ties := STATUS_TIES_KEYS
+    else
+      Ties := STATUS_TIES_NONE;
+    Result := StartTaskFor(Slot, TASK_STATUSA, Ties, 0, Idx, 0, '', False, False,
       False, False, False);
     Exit;
   end;
@@ -1084,6 +1093,7 @@ begin
     ExportFailed('Out_Line');
     TempStringResult := '';
   end;
+  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;
 
@@ -1316,5 +1326,6 @@ begin
   except
     ExportFailed('Multi_Notice');
   end;
+  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;

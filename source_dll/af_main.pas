@@ -3,8 +3,8 @@ library antifake_dll;
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}cthreads, BaseUnix,{$ENDIF}
-  SysUtils, Classes, Math, DateUtils, Process, dynlibs, fphttpclient, fpjson, jsonparser, mysqlwire;
+  {$IFDEF UNIX}cthreads, BaseUnix, Unix,{$ENDIF}
+  SysUtils, Classes, Math, DateUtils, Process, dynlibs, fphttpclient, ssockets, fpjson, jsonparser, crc, mysqlwire;
 
 { ---------------- the library, module by module ----------------
 
@@ -91,6 +91,7 @@ initialization
   end;
   InitCriticalSection(MirrorCS);
   InitCriticalSection(SharedCS);
+  InitCriticalSection(SharedDiskCS);
   SharedGeoNew := TStringList.Create;
   InitCriticalSection(NoticeCS);
   NoticeList := TStringList.Create;
@@ -146,7 +147,9 @@ initialization
   end;
 
 finalization
-  Cleanup();
+  { never Cleanup itself: this runs under the lock of the loader, where no thread can be
+    waited for (see CleanupAtUnload) }
+  CleanupAtUnload;
   FreeAndNil(LogQueue);
   DoneCriticalSection(LogCS);
   FreeAndNil(BgThreads);
@@ -166,6 +169,7 @@ finalization
   GeoFailed.Free;
   FreeAndNil(SharedGeoNew);
   DoneCriticalSection(SharedCS);
+  DoneCriticalSection(SharedDiskCS);
   { the rest of what the start made: a script that is loaded again (/recompile) gets a fresh
     library, and these were left behind by every old one }
   for i := 0 to MAX_SLOTS do FreeAndNil(Outp[i].Lines);

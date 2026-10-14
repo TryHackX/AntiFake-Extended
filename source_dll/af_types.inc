@@ -43,6 +43,12 @@ const
   TASK_CHECKP = 5;
   TASK_CHECKD = 6;
   TASK_STATUSA = 7;
+  { how much of the ties of an account TASK_STATUSA looks for (its Kind): an admin gets every
+    account that shares something, names too; a player who may ask /multi about the account
+    only the Steam accounts, computers and addresses (from the indexes); anybody else none }
+  STATUS_TIES_ALL = 0;
+  STATUS_TIES_KEYS = 1;
+  STATUS_TIES_NONE = 2;
   TASK_LIST = 8;
   TASK_ADVANCED_SEARCH = 9;
   TASK_GEOSEARCH = 10;
@@ -77,7 +83,7 @@ const
 
   VISITS_MAGIC = $53545356;   { "VSTS": the visit section at the end of the database }
   DEF_ACTIVE_DAYS = 30;
-  AF_VERSION = '2.0';
+  AF_VERSION = '2.1';
   { where the data lives (Engine in settings.ini) }
   ENGINE_BIN = 0;      { local: the file alone }
   ENGINE_MIRROR = 1;   { the file, with a copy of it in the database for a website, read back at
@@ -265,6 +271,8 @@ type
     MysqlDatabase: string;
     MysqlUser: string;
     MysqlPassword: string;
+    { the RSA public key of the database server (a PEM file); '' = the server is asked for it }
+    MysqlServerKey: string;
     MysqlServerId: Integer;
     MysqlMinutes: Integer;
     SyncSeconds: Integer;         { Engine = mysql: how often the changes are exchanged }

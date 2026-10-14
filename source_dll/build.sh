@@ -43,6 +43,11 @@ OPTS="-O2 -Xs -XX -CX"
 if [ "$1" = "debug" ]; then
   OPTS="-O1 -gl -gw -Cr -Co -Ci -CX"
 fi
+# PIC=1 sh build.sh: position independent code. Without it the library has relocations in its
+# code (TEXTREL), which a system with SELinux or PaX may refuse to load.
+if [ "$PIC" = "1" ]; then
+  OPTS="$OPTS -Cg"
+fi
 OUT=build/i386-linux
 mkdir -p "$OUT"
 
@@ -71,6 +76,9 @@ rm -rf "$probe"
 
 # the copy into MySQL is always part of the library and needs nothing else on the server
 "$FPC" -B -Pi386 -Tlinux -Mobjfpc -Sh $OPTS ${UNITPATH:+"$UNITPATH"} -FU"$OUT" -FE"$OUT" -oantifake_dll.so af_main.pas
-cp -f "$OUT/antifake_dll.so" ../antifake_dll.so
-chmod 755 ../antifake_dll.so
-echo "Built ../antifake_dll.so"
+# A new file beside the old one, renamed over it: a running server keeps the library it loaded
+# (a copy onto that file would change its code under the server and crash it).
+cp -f "$OUT/antifake_dll.so" ../antifake_dll.so.new
+chmod 755 ../antifake_dll.so.new
+mv -f ../antifake_dll.so.new ../antifake_dll.so
+echo "Built ../antifake_dll.so - a running server uses it from its next start or /recompile"

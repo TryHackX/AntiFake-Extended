@@ -61,6 +61,12 @@ const
     'looked_up = GREATEST(looked_up, VALUES(looked_up))';
 
   AFS_COLLECT = 64;     { profiles packed per hold of the lock }
+  { Profiles pushed by one exchange; the rest stay marked and go with the next ones. The lock on
+    'seq' is held from the first profile to the COMMIT, and the other servers wait for it at most
+    30 seconds: hundreds of profiles at once (a database that was gone for an hour, a cleanup
+    that changed many) took longer than that over a remote link, and every other server's
+    exchange failed meanwhile. }
+  AFS_PUSH = 200;
   AFS_APPLY = 16;       { profiles put into memory per hold of the lock }
   AFS_PAGE = 500;       { rows of the other servers per question }
   SHARED_MAGIC = $48534641;   { "AFSH": the numbers beside the file }
@@ -97,10 +103,18 @@ type
 
 var
   SharedCS: TRTLCriticalSection;
+  { held through the whole of SharedWriteDisk, so one image of the numbers is collected and
+    written before the next one is: two writers (the exchange and the full write) each read the
+    marks of the file, collected and wrote in three steps, and the older image could land last.
+    It is always taken before ProfilesCritSec and SharedCS, never while either is held. }
+  SharedDiskCS: TRTLCriticalSection;
   SharedThread: TSharedThread = nil;
   SharedWake: PRTLEvent = nil;
   SharedStopping: Boolean = False;
   SharedMissed: Integer = 0;          { changes without the state before them; ProfilesCritSec }
+  { the last collection stopped at AFS_PUSH profiles and more are marked; the exchange thread
+    (or the start, before it runs) alone }
+  SharedPushMore: Boolean = False;
   { the rest belongs to SharedCS }
   SharedPullSeq: Int64 = 0;
   SharedOnline: Boolean = False;
@@ -355,11 +369,13 @@ begin
     end;
     Result[j + 1] := T;
   end;
-  if (Settings.VisitKeepCount > 0) and (n > Settings.VisitKeepCount) then
+  { VisitKeepCount = 0 is the most an account can hold, not "no limit" (see VisitLimit) }
+  j := VisitLimit;
+  if n > j then
   begin
-    for i := 0 to Settings.VisitKeepCount - 1 do
-      Result[i] := Result[i + n - Settings.VisitKeepCount];
-    n := Settings.VisitKeepCount;
+    for i := 0 to j - 1 do
+      Result[i] := Result[i + n - j];
+    n := j;
   end;
   SetLength(Result, n);
 end;
@@ -460,8 +476,9 @@ end;
 
 { Which account here is which account of the database, and what changed here that the database
   has not got yet, with the state before it. It belongs to the file on disk - its size and time
-  are in it - and is only written while memory has the numbers of that file. }
-procedure SharedWriteDisk;
+  are in it - and is only written while memory has the numbers of that file. The caller holds
+  SharedDiskCS (SharedWriteDisk below). }
+procedure SharedWriteDiskNow;
 var
   Ids, PendIdx: array of LongInt;
   PendBase: array of AnsiString;
@@ -525,6 +542,10 @@ begin
           FS.WriteBuffer(Len, SizeOf(Len));
           if Len > 0 then FS.WriteBuffer(PendBase[k][1], Len);
         end;
+        { on the disk before the rename: a power cut right after it would otherwise leave the
+          new name on blocks that were never written, and the next start would refuse the file
+          and take the database as it is, without what waited here }
+        SyncFileHandle(FS.Handle);
       finally FS.Free; end;
       { in one step: deleting the old one first left a moment without any, and a server killed
         then took the database as it is at its next start, without what waited here }
@@ -536,6 +557,14 @@ begin
     except
     end;
   finally LeaveCriticalSection(SharedCS); end;
+end;
+
+procedure SharedWriteDisk;
+begin
+  EnterCriticalSection(SharedDiskCS);
+  try
+    SharedWriteDiskNow;
+  finally LeaveCriticalSection(SharedDiskCS); end;
 end;
 
 { the caller holds ProfilesCritSec; False when there is none, or it belongs to another file }
@@ -927,6 +956,7 @@ begin
   Items := nil;
   Verd := nil;
   Geo := nil;
+  SharedPushMore := False;
   n := 0;
   i := 0;
   repeat
@@ -938,6 +968,12 @@ begin
       begin
         if (i < Length(SharedDirtyArr)) and (SharedDirtyArr[i] <> 0) then
         begin
+          { enough for one exchange: this one and the rest keep their marks }
+          if n >= AFS_PUSH then
+          begin
+            SharedPushMore := True;
+            Break;
+          end;
           if Held >= AFS_COLLECT then
           begin
             More := True;
@@ -1379,7 +1415,7 @@ end;
 procedure TSharedThread.Execute;
 var
   Why: string;
-  Wait, Fails: Integer;
+  Wait, Fails, Rounds: Integer;
 begin
   GuardWorkerThread;
   Fails := 0;
@@ -1395,9 +1431,11 @@ begin
       Inc(Fails);
     end;
   end;
-  { the last exchange: what changed here goes in }
+  { the last exchange: what changed here goes in, AFS_PUSH profiles at a time (what is left
+    when the stop cuts it waits beside the file) }
   try
-    SharedRound(False, Why);
+    Rounds := 0;
+    while SharedRound(False, Why) and SharedPushMore and (Rounds < 1000) do Inc(Rounds);
   except
   end;
 end;
@@ -1855,7 +1893,10 @@ begin
         SharedQueueLocal;
         Queued := True;
         DropMysqlConnection(C);
-        if not SharedRound(False, Why) then raise Exception.Create(Why);
+        { all of it, AFS_PUSH profiles per exchange, before the database is read }
+        repeat
+          if not SharedRound(False, Why) then raise Exception.Create(Why);
+        until not SharedPushMore;
         C := NewMysqlConnection;
         C.Connect;
       end

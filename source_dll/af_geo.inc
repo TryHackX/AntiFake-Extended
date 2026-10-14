@@ -10,6 +10,13 @@ const
   { after a lookup that got no answer nothing is asked for a while: 1 minute, then 2, 4 ... }
   GEO_PAUSE_FIRST = 60;
   GEO_PAUSE_MAX = 1800;
+  { The service says how long to wait when its minute is used up (X-Ttl, at most 60 seconds in
+    practice); a longer wait than this is not taken from an answer that came over plain HTTP,
+    where anyone on the way can write it - 99999999 stopped every lookup until the restart. }
+  GEO_TTL_MAX = 300;
+  { An answer is a few hundred bytes; one bigger than this, headers included, is refused before
+    it is all read, so up to MaxLookups of them never fill the memory of the server. }
+  GEO_ANSWER_MAX = 16 * 1024;
 
 var
   { when the last GEO_PER_MINUTE lookups started (GetTickCount64), as a ring. GeoCritSec. }
@@ -107,6 +114,50 @@ begin
   end;
 end;
 
+{ The limits of one lookup, checked at every read of the connection. TimeoutMs of the client
+  holds for each read alone, so an answer that came a byte at a time kept the thread for hours,
+  longer than the end of the library waits for it; the whole lookup now ends after twice
+  TimeoutMs (and the read running then), whatever the other side sends. }
+type
+  EGeoLimit = class(Exception);
+
+  TGeoSocket = class(TSocketHandler)
+  public
+    Deadline: QWord;
+    Got: Integer;
+    function Recv(const Buffer; Count: Integer): Integer; override;
+  end;
+
+  TGeoClient = class(TFPHTTPClient)
+  public
+    Deadline: QWord;
+    procedure GiveSocket(Sender: TObject; const UseSSL: Boolean; out AHandler: TSocketHandler);
+  end;
+
+function TGeoSocket.Recv(const Buffer; Count: Integer): Integer;
+begin
+  if GetTickCount64 > Deadline then raise EGeoLimit.Create('the answer took too long');
+  Result := inherited Recv(Buffer, Count);
+  if Result > 0 then
+  begin
+    Inc(Got, Result);
+    if Got > GEO_ANSWER_MAX then raise EGeoLimit.Create('the answer is too big');
+  end;
+end;
+
+procedure TGeoClient.GiveSocket(Sender: TObject; const UseSSL: Boolean; out AHandler: TSocketHandler);
+begin
+  { the plain one: the lookup never goes over TLS }
+  AHandler := TGeoSocket.Create;
+  TGeoSocket(AHandler).Deadline := Deadline;
+end;
+
+{ a pause the service asked for, kept within GEO_TTL_MAX }
+function GeoTtl(Headers: TStrings): Integer;
+begin
+  Result := Min(GEO_TTL_MAX, Max(1, StrToIntDef(GeoHeader(Headers, 'X-Ttl'), GEO_PAUSE_FIRST)));
+end;
+
 constructor TGeoThread.Create(const TargetIP: string);
 begin
   inherited Create(True);
@@ -115,7 +166,7 @@ end;
 
 procedure TGeoThread.Execute;
 var
-  Client: TFPHTTPClient;
+  Client: TGeoClient;
   Response: string;
   JData: TJSONData;
   JObj: TJSONObject;
@@ -127,17 +178,19 @@ begin
   Pause := 0;
   { whatever happens, the thread has to report that it is gone: Cleanup counts on it }
   try
-  Client := TFPHTTPClient.Create(nil);
+  Client := TGeoClient.Create(nil);
   Client.ConnectTimeout := Settings.GeoTimeoutMs;
   Client.IOTimeout := Settings.GeoTimeoutMs;
+  Client.Deadline := GetTickCount64 + 2 * QWord(Settings.GeoTimeoutMs);
+  Client.OnGetSocketHandler := @Client.GiveSocket;
   try
     try
       Response := Client.Get('http://ip-api.com/json/' + FIP + '?fields=20181819');
       { the last question of the service's minute: the next lookup waits for the next one }
       if GeoHeader(Client.ResponseHeaders, 'X-Rl') = '0' then
-        Pause := Max(1, StrToIntDef(GeoHeader(Client.ResponseHeaders, 'X-Ttl'), GEO_PAUSE_FIRST));
+        Pause := GeoTtl(Client.ResponseHeaders);
 
-      JData := GetJSON(Response);
+      JData := GetJSON(AsUtf8(Response));
       try
         { an answer that is not an object, or has no status, is no place (it used to end in an
           access violation that only the except below caught) }
@@ -158,18 +211,18 @@ begin
             end;
 
             with GeoCache[Idx] do begin
-              SetGeoString(Continent, JObj.Get('continent', 'UNK'));
-              SetGeoString(ContinentCode, JObj.Get('continentCode', 'UNK'));
+              SetGeoString(Continent, Utf8Bytes(JObj.Get('continent', 'UNK')));
+              SetGeoString(ContinentCode, Utf8Bytes(JObj.Get('continentCode', 'UNK')));
 
-              SetGeoString(Country, JObj.Get('country', 'Unknown'));
-              SetGeoString(CountryCode, JObj.Get('countryCode', '??'));
-              SetGeoString(Region, JObj.Get('regionName', 'Unknown'));
-              SetGeoString(City, JObj.Get('city', 'Unknown'));
-              SetGeoString(Zip, JObj.Get('zip', ''));
+              SetGeoString(Country, Utf8Bytes(JObj.Get('country', 'Unknown')));
+              SetGeoString(CountryCode, Utf8Bytes(JObj.Get('countryCode', '??')));
+              SetGeoString(Region, Utf8Bytes(JObj.Get('regionName', 'Unknown')));
+              SetGeoString(City, Utf8Bytes(JObj.Get('city', 'Unknown')));
+              SetGeoString(Zip, Utf8Bytes(JObj.Get('zip', '')));
 
-              SetGeoString(ISP, JObj.Get('isp', 'Unknown'));
-              SetGeoString(ReverseDNS, JObj.Get('reverse', ''));
-              SetGeoString(Timezone, JObj.Get('timezone', ''));
+              SetGeoString(ISP, Utf8Bytes(JObj.Get('isp', 'Unknown')));
+              SetGeoString(ReverseDNS, Utf8Bytes(JObj.Get('reverse', '')));
+              SetGeoString(Timezone, Utf8Bytes(JObj.Get('timezone', '')));
 
               if JObj.Get('mobile', False) then IsMobile := 1 else IsMobile := 0;
               if JObj.Get('proxy', False) then IsProxy := 1 else IsProxy := 0;
@@ -193,7 +246,7 @@ begin
       { refused for asking too often (429: as long as it says), or no answer at all: every
         lookup waits, longer after every failure in a row }
       if Client.ResponseStatusCode = 429 then
-        Pause := Max(1, StrToIntDef(GeoHeader(Client.ResponseHeaders, 'X-Ttl'), GEO_PAUSE_FIRST))
+        Pause := GeoTtl(Client.ResponseHeaders)
       else
         Pause := -1;
     end;
@@ -280,7 +333,8 @@ begin
     try
       ForceDirectories(LOG_DIR);
       if FileExists(LOG_DIR + DirectorySeparator + 'trace.log') then Append(F) else Rewrite(F);
-      WriteLn(F, FormatDateTime('hh:nn:ss.zzz', Now), '  ', Step);
+      { the HWID of a player comes from the client unfiltered: no control characters (LogSafe) }
+      WriteLn(F, FormatDateTime('hh:nn:ss.zzz', Now), '  ', LogSafe(Step));
       CloseFile(F);
     except
     end;
@@ -402,10 +456,66 @@ begin
       Result := k;
 end;
 
+const
+  { the most visits of one account that a file, a journal or an exchange is believed to hold;
+    more is a damaged count, not a list }
+  MAX_VISITS_READ = 100000;
+
+{ How many visits an account keeps. VisitKeepCount = 0 ("no limit") is the most any account
+  can hold: the file, the journal and the exchange of Engine = mysql carry no more than that,
+  and an account with more used to end the reading of everything after it. }
+function VisitLimit: Integer;
+begin
+  Result := Settings.VisitKeepCount;
+  if (Result <= 0) or (Result > MAX_VISITS_HARD) then Result := MAX_VISITS_HARD;
+end;
+
+{ keeps the Keep newest visits of V (by their start), in the order they had; for a list read
+  from a file or a journal that holds more than an account may keep }
+procedure KeepNewestVisits(var V: TVisitArray; Keep: Integer);
+var
+  Top: array of Double;     { the latest starts, latest first }
+  Filled, i, j, Above, TieRoom: Integer;
+  Cut: Double;
+  R: TVisitArray;
+begin
+  if (Keep <= 0) or (Length(V) <= Keep) then Exit;
+  SetLength(Top, Keep);
+  Filled := 0;
+  for i := 0 to High(V) do
+  begin
+    if (Filled = Keep) and (V[i].Started <= Top[Keep - 1]) then Continue;
+    if Filled < Keep then Inc(Filled);
+    j := Filled - 1;
+    while (j > 0) and (Top[j - 1] < V[i].Started) do
+    begin
+      Top[j] := Top[j - 1];
+      Dec(j);
+    end;
+    Top[j] := V[i].Started;
+  end;
+  Cut := Top[Keep - 1];
+  Above := 0;
+  for i := 0 to High(V) do
+    if V[i].Started > Cut then Inc(Above);
+  { of the visits that started at the cut, the last ones in the list are kept }
+  TieRoom := Keep - Above;
+  SetLength(R, Keep);
+  j := Keep;
+  for i := High(V) downto 0 do
+    if (V[i].Started > Cut) or ((V[i].Started = Cut) and (TieRoom > 0)) then
+    begin
+      if V[i].Started = Cut then Dec(TieRoom);
+      Dec(j);
+      R[j] := V[i];
+    end;
+  V := R;
+end;
+
 { the caller holds ProfilesCritSec }
 procedure TrimVisits(Index: Integer);
 var
-  k, Oldest: Integer;
+  k, Oldest, Keep: Integer;
   Limit: Double;
 begin
   if Settings.VisitKeepDays > 0 then
@@ -419,7 +529,8 @@ begin
         SetLength(Profiles[Index].Visits, Length(Profiles[Index].Visits) - 1);
       end;
   end;
-  while (Settings.VisitKeepCount > 0) and (Length(Profiles[Index].Visits) > Settings.VisitKeepCount) do
+  Keep := VisitLimit;
+  while Length(Profiles[Index].Visits) > Keep do
   begin
     Oldest := 0;
     for k := 1 to High(Profiles[Index].Visits) do

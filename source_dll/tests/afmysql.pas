@@ -20,7 +20,7 @@ program afmysql;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, dynlibs, mysqlwire;
+  SysUtils, Classes, dynlibs, base64, mysqlwire;
 
 type
   TPathProc = procedure(Path: PChar); cdecl;
@@ -37,6 +37,9 @@ type
   TSlotCount = function(Slot: LongInt): LongInt; cdecl;
   TSlotLine = function(Slot, Index: LongInt): PChar; cdecl;
   TSelect = procedure(PlayerID: LongInt); cdecl;
+
+const
+  SOLDAT_NAME_MAX = 24;   { the longest name a player can have in Soldat }
 
 var
   Failures: LongInt = 0;
@@ -157,6 +160,8 @@ begin
     L.Add('SharedLinks = 1');
     L.Add('[PlayerCommands]');
     L.Add('PlayerStatus = all');
+    { the ties of an account are in a player's status only when they may ask /multi about it }
+    L.Add('PlayerMulti = all');
     L.SaveToFile(IniPath);
   finally
     L.Free;
@@ -278,6 +283,127 @@ begin
   finally
     R.Free;
   end;
+end;
+
+{ ---- the key the password is encrypted with (no TLS) ---- }
+
+const
+  { a key of nobody: given instead of the server's own, the server cannot read the password }
+  OTHER_KEY = '-----BEGIN PUBLIC KEY-----'#10 +
+    'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsWrNWnVkVQorr42yRsuJ'#10 +
+    'c1pLez3+Nspt4Qjat5L5W68o2zZNjiEZ4+5GigbfTZgJB8wSUe/7Oc9htHMnwKjT'#10 +
+    'lrD0kwRvRkYxi2tnusZW7UxP2vfjMBRZo1YEgBby323OXQZBO6/2k7qcpta9v4/N'#10 +
+    'JEHT9lFqfQx/xCe/LEbZRNuk1WgDB9qp4pL5cPHRH3I16PgbNXuIbDE3ruM8gPgE'#10 +
+    'EOb1u80aoOdkeMIgpDodEJ3nqvfrf/r4pt0F1Ap/lvz3DtX2gSLF/zCWFmu1Dd1p'#10 +
+    'Yu5rOlDUtLnm3g1zvp1EtlOPvdrATmjGNyHai8AI1MEPnBy27caWy9zhsQphJ673'#10 +
+    'BwIDAQAB'#10 +
+    '-----END PUBLIC KEY-----'#10;
+
+{ a PEM "RSA PUBLIC KEY" of these two numbers (big-endian) }
+function RsaPem(const N, E: AnsiString): AnsiString;
+
+  function DerLen(L: LongInt): AnsiString;
+  begin
+    if L < $80 then
+      Result := AnsiChar(L)
+    else if L < $100 then
+      Result := #$81 + AnsiChar(L)
+    else
+      Result := #$82 + AnsiChar(L shr 8) + AnsiChar(L and $FF);
+  end;
+
+  function DerInt(const V: AnsiString): AnsiString;
+  begin
+    Result := #$02 + DerLen(Length(V) + 1) + #0 + V;
+  end;
+
+var
+  Body: AnsiString;
+begin
+  Body := DerInt(N) + DerInt(E);
+  Result := '-----BEGIN RSA PUBLIC KEY-----'#10 + EncodeStringBase64(#$30 + DerLen(Length(Body)) + Body) +
+    #10'-----END RSA PUBLIC KEY-----'#10;
+end;
+
+{ '' when the password could be encrypted with the key, else what went wrong }
+function RsaError(const Pem: AnsiString; Aborted: PBoolean): AnsiString;
+begin
+  Result := '';
+  try
+    MyRsaEncrypt(Pem, 'password', Aborted);
+  except
+    on E: Exception do Result := E.Message;
+  end;
+end;
+
+{ a login of the user of the test after FLUSH PRIVILEGES, which empties the cache of
+  caching_sha2_password: the login takes the full path, with the password encrypted by RSA.
+  '' when it worked, else what went wrong }
+function FullLogin(const Key: AnsiString): AnsiString;
+var
+  T: TMyConnection;
+begin
+  C.Exec('FLUSH PRIVILEGES');
+  T := Conn;
+  try
+    T.ServerPublicKey := Key;
+    try
+      T.Connect;
+      Result := '';
+    except
+      on E: Exception do Result := E.Message;
+    end;
+  finally
+    T.Free;
+  end;
+end;
+
+procedure KeyChecks;
+var
+  Pem, Plugin, Path: AnsiString;
+  R: TMyResult;
+  Flag: Boolean;
+begin
+  Check('a key of the server of more than 8192 bits is refused',
+    Pos('too big', RsaError(RsaPem(#$C1 + StringOfChar(#$5B, 1024), #1#0#1), nil)) > 0);
+  Check('an exponent of more than 4 bytes is refused',
+    Pos('too big', RsaError(RsaPem(#$C1 + StringOfChar(#$5B, 255), #1#0#0#0#1), nil)) > 0);
+  Check('a key of 8192 bits is still taken', RsaError(RsaPem(#$C1 + StringOfChar(#$5B, 1023), #1#0#1), nil) = '');
+  Flag := True;
+  Check('Abort ends the computing with the key', Pos('cut', RsaError(OTHER_KEY, @Flag)) > 0);
+  Check('the old call without Abort still encrypts', Length(MyRsaEncrypt(OTHER_KEY, 'password')) = 256);
+
+  Plugin := '';
+  try
+    Plugin := Scalar('SELECT plugin FROM mysql.user WHERE CONCAT(user, ''@'', host) = CURRENT_USER()');
+  except
+  end;
+  Pem := '';
+  try
+    R := C.Query('SHOW STATUS LIKE ''Caching_sha2_password_rsa_public_key''');
+    try
+      if R.RowCount > 0 then Pem := R.Str(0, 1);
+    finally R.Free; end;
+  except
+  end;
+  if (Plugin <> 'caching_sha2_password') or (Pos('-----BEGIN', Pem) = 0) then
+  begin
+    WriteLn('       (the user logs in with ', Plugin, ': no RSA on this server, the key checks are skipped)');
+    Exit;
+  end;
+  Path := ExpandFileName('afmysql-server-key.pem');
+  with TStringList.Create do
+  try
+    Text := Pem;
+    SaveToFile(Path);
+  finally Free; end;
+  Check('the full path without a key given: the server is asked for its key, as before', FullLogin('') = '');
+  Check('with the key of the server given as text the full path logs in', FullLogin(Pem) = '');
+  Check('with the path of its file too', FullLogin(Path) = '');
+  Check('with another key given the login fails: the given key is used, never one the server sends',
+    FullLogin(OTHER_KEY) <> '');
+  Check('a key file that is not there says so', Pos('cannot be read from', FullLogin(Path + '.missing')) > 0);
+  DeleteFile(Path);
 end;
 
 function WaitMirror: Boolean;
@@ -434,6 +560,17 @@ begin
   if Same then
     for i := 0 to n - 1 do
     begin
+      { A name of a player has at most 24 characters in Soldat, one byte each in the code page of
+        the console, so it never comes near the 64 characters of the columns. The test file has
+        a longer one on purpose (the storage cuts it): it is compared as far as a real name goes,
+        and not counted as lost when the copy cuts it too. }
+      if (Length(Names1[i]) > SOLDAT_NAME_MAX) and (Copy(StrPas(ProfileName(i)), 1, SOLDAT_NAME_MAX) =
+        Copy(Names1[i], 1, SOLDAT_NAME_MAX)) and (StrPas(ProfileName(i)) <> Names1[i]) then
+      begin
+        WriteLn('       account ', i, ': a name longer than any Soldat name (', Length(Names1[i]), ' characters) came back as ',
+          Length(StrPas(ProfileName(i))), ' - not counted as lost');
+        Names1[i] := StrPas(ProfileName(i));
+      end;
       if (StrPas(ProfileName(i)) <> Names1[i]) or (StrPas(ProfileSteam(i)) <> Steams1[i]) or (VisitCount(i) <> Visits1[i]) or
          (StrPas(SteamInfo(i)) <> Steam1[i]) then
       begin
@@ -506,6 +643,8 @@ begin
   Check('Engine = mirror without MysqlHost: the file is read, and the note says so',
     (not LoadFailed()) and (ProfileCount() = n) and
     (Pos('Engine = mirror, but no MysqlHost', StrPas(LoadNote())) = 1));
+
+  KeyChecks;
 
   DropTables;
   C.Free;

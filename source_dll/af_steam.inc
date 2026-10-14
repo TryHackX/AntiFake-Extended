@@ -84,7 +84,11 @@ begin
       Proc.Input.Write(Config[1], Length(Config));
       Proc.CloseInput;
       Waited := 0;
-      while Proc.Running and (Waited < Settings.CurlTimeoutSeconds * 1000 + 2000) do
+      { the end of the server does not wait for Steam: Cleanup gives the threads in the
+        background only so long, and a thread still in here after that kept the library from
+        being unloaded safely }
+      while Proc.Running and (Waited < Settings.CurlTimeoutSeconds * 1000 + 2000) and
+            not ShuttingDown do
       begin
         Take;
         Sleep(20);
@@ -93,7 +97,10 @@ begin
       if Proc.Running then
       begin
         Proc.Terminate(255);
-        Problem := 'curl did not answer in ' + IntToStr(Settings.CurlTimeoutSeconds) + ' s';
+        if ShuttingDown then
+          Problem := 'the server is shutting down'
+        else
+          Problem := 'curl did not answer in ' + IntToStr(Settings.CurlTimeoutSeconds) + ' s';
         Exit;
       end;
       Take;
@@ -215,7 +222,7 @@ begin
       else
       begin
         Usable := True;
-        JData := GetJSON(Answer);
+        JData := GetJSON(AsUtf8(Answer));
         try
           Node := JData.FindPath('response.players');
           if (Node <> nil) and (Node.JSONType = jtArray) then
@@ -235,8 +242,8 @@ begin
                 begin
                   SharedTouch(Idx);
                   SetGeoString(Profiles[Idx].Steam.SteamId, Id);
-                  SetGeoString(Profiles[Idx].Steam.Persona, Obj.Get('personaname', ''));
-                  SetGeoString(Profiles[Idx].Steam.Country, Obj.Get('loccountrycode', ''));
+                  SetGeoString(Profiles[Idx].Steam.Persona, Utf8Bytes(Obj.Get('personaname', '')));
+                  SetGeoString(Profiles[Idx].Steam.Country, Utf8Bytes(Obj.Get('loccountrycode', '')));
                   Created := Obj.Get('timecreated', 0);
                   if Created > 0 then Profiles[Idx].Steam.Created := UnixToDateTime(Created);
                   if Obj.Get('communityvisibilitystate', 1) = 3 then
@@ -268,7 +275,7 @@ begin
                  Key + '&steamids=' + FIds, Answer, Code, Problem) and (Code = 200) and
          (Copy(TrimLeft(Answer), 1, 1) = '{') then
       begin
-        JData := GetJSON(Answer);
+        JData := GetJSON(AsUtf8(Answer));
         try
           Node := JData.FindPath('players');
           if (Node <> nil) and (Node.JSONType = jtArray) then
@@ -414,10 +421,14 @@ begin
   if not TakeList(P.OtherHWIDs) then Exit;
   if not TakeList(P.OtherIPs) then Exit;
   if not Take(n, SizeOf(n)) then Exit;
-  if (n < 0) or (n > MAX_VISITS_HARD) then Exit;
+  { more visits than an account keeps (written with VisitKeepCount = 0 by 2.0) are read, and
+    the newest are kept: refusing the record lost every record after it in the journal }
+  if (n < 0) or (n > MAX_VISITS_READ) or
+     (Int64(n) * SizeOf(TVisitEntry) > Int64(Length(Data)) - Pos + 1) then Exit;
   SetLength(P.Visits, n);
   for q := 0 to n - 1 do
     if not Take(P.Visits[q], SizeOf(TVisitEntry)) then Exit;
+  KeepNewestVisits(P.Visits, MAX_VISITS_HARD);
   if not Take(P.Steam, SizeOf(TSteamInfo)) then Exit;
   { from the journal or from another server: a date that is no date is "never" }
   SaneProfile(P);
@@ -629,6 +640,19 @@ end;
   ones written out, #17 shares a computer and an address, scores 80 on two signals and nobody
   has judged the pair yet, and #22 shares an address, scores 25 on one signal and an admin
   marked it as one family. Empty when the account plays alone, which is the usual answer. }
+{ a text a player chose (a nick, a Steam name) as one field of a line split at Seps: each of
+  them becomes '/', so the fields after it stay where they are }
+function FieldText(const S, Seps: string): string;
+var
+  i: Integer;
+begin
+  Result := S;
+  for i := 1 to Length(Result) do
+    if Pos(Result[i], Seps) > 0 then Result[i] := '/';
+end;
+
+{ Get_Multi_Links and Get_Steam_Info are not used by the script any more (the views draw from
+  the profiles themselves); they are kept for the test programs and for tools. }
 function Get_Multi_Links(ProfileIdx, MaxNames: Integer): PChar; cdecl;
 var
   Links: TStringList;
@@ -636,30 +660,35 @@ var
   i, Why, Other, Score, Signals: Integer;
 begin
   R := '';
-  if MaxNames < 1 then MaxNames := 8;
-  Links := TStringList.Create;
   try
-    if GrabProfiles(20) then
+    if MaxNames < 1 then MaxNames := 8;
+    Links := TStringList.Create;
     try
-      CollectLinks(ProfileIdx, Links);
-      if Links.Count >= Settings.MultiMinLinks then
-      begin
-        R := IntToStr(Links.Count);
-        for i := 0 to Links.Count - 1 do
+      if GrabProfiles(20) then
+      try
+        CollectLinks(ProfileIdx, Links);
+        if Links.Count >= Settings.MultiMinLinks then
         begin
-          if i >= MaxNames then Break;
-          Other := StrToIntDef(Links[i], -1);
-          Why := Integer(PtrInt(Links.Objects[i]));
-          if (Other < 0) or (Other >= ProfileCount) then Continue;
-          Score := LinkScore(ProfileIdx, Other, Why, Reasons, Signals);
-          R := R + '|' + Links[i] + ':' + IntToStr(Why) + ':' + IntToStr(Score) + ':' +
-               IntToStr(Signals) + ':' + IntToStr(VerdictOf(ProfileIdx, Other)) + ':' +
-               GetProfileActiveName(Other);
+          R := IntToStr(Links.Count);
+          for i := 0 to Links.Count - 1 do
+          begin
+            if i >= MaxNames then Break;
+            Other := StrToIntDef(Links[i], -1);
+            Why := Integer(PtrInt(Links.Objects[i]));
+            if (Other < 0) or (Other >= ProfileCount) then Continue;
+            Score := LinkScore(ProfileIdx, Other, Why, Reasons, Signals);
+            R := R + '|' + Links[i] + ':' + IntToStr(Why) + ':' + IntToStr(Score) + ':' +
+                 IntToStr(Signals) + ':' + IntToStr(VerdictOf(ProfileIdx, Other)) + ':' +
+                 FieldText(GetProfileActiveName(Other), '|:');
+          end;
         end;
-      end;
-    finally UnlockProfiles; end;
-  finally
-    Links.Free;
+      finally UnlockProfiles; end;
+    finally
+      Links.Free;
+    end;
+  except
+    ExportFailed('Get_Multi_Links');
+    R := '';
   end;
   TempStringResult := R;
   Result := PChar(TempStringResult);
@@ -705,39 +734,43 @@ var
   Ids: string;
   k: Integer;
 begin
-  if (Settings.SteamKey = '') or ShuttingDown then Exit;
-  if not GrabLock(SteamCS, 5) then Exit;
   try
-    { a key that is no key goes into no address: said once, and nothing is asked }
-    if (SteamRefusedKey <> Settings.SteamKey) and not SteamKeyUsable(Settings.SteamKey) then
-    begin
-      SteamRefusedKey := Settings.SteamKey;
-      SteamLastError := 'SteamApiKey in settings.ini is not a Steam Web API key (only letters and digits)';
-      if SteamQueue <> nil then SteamQueue.Clear;
-      Notice(MAX_SLOTS, Settings.ColError, 'Steam: ' + SteamLastError + ' - nothing is asked until it is changed.');
-      Exit;
-    end;
-    if SteamRefusedKey = Settings.SteamKey then Exit;
-    if GetTickCount64 < SteamPauseUntil then Exit;
-    if SteamBusy or (SteamQueue = nil) or (SteamQueue.Count = 0) then Exit;
-    Ids := '';
-    k := 0;
-    while (SteamQueue.Count > 0) and (k < Settings.SteamBatch) do
-    begin
-      if Ids <> '' then Ids := Ids + ',';
-      Ids := Ids + SteamQueue[0];
-      SteamQueue.Delete(0);
-      Inc(k);
-    end;
-    if Ids = '' then Exit;
-    SteamBusy := True;
-    Inc(SteamAsked, k);
+    if (Settings.SteamKey = '') or ShuttingDown then Exit;
+    if not GrabLock(SteamCS, 5) then Exit;
     try
-      StartBackground(TSteamThread.Create(Ids));
-    except
-      SteamBusy := False;
-    end;
-  finally LeaveCriticalSection(SteamCS); end;
+      { a key that is no key goes into no address: said once, and nothing is asked }
+      if (SteamRefusedKey <> Settings.SteamKey) and not SteamKeyUsable(Settings.SteamKey) then
+      begin
+        SteamRefusedKey := Settings.SteamKey;
+        SteamLastError := 'SteamApiKey in settings.ini is not a Steam Web API key (only letters and digits)';
+        if SteamQueue <> nil then SteamQueue.Clear;
+        Notice(MAX_SLOTS, Settings.ColError, 'Steam: ' + SteamLastError + ' - nothing is asked until it is changed.');
+        Exit;
+      end;
+      if SteamRefusedKey = Settings.SteamKey then Exit;
+      if GetTickCount64 < SteamPauseUntil then Exit;
+      if SteamBusy or (SteamQueue = nil) or (SteamQueue.Count = 0) then Exit;
+      Ids := '';
+      k := 0;
+      while (SteamQueue.Count > 0) and (k < Settings.SteamBatch) do
+      begin
+        if Ids <> '' then Ids := Ids + ',';
+        Ids := Ids + SteamQueue[0];
+        SteamQueue.Delete(0);
+        Inc(k);
+      end;
+      if Ids = '' then Exit;
+      SteamBusy := True;
+      Inc(SteamAsked, k);
+      try
+        StartBackground(TSteamThread.Create(Ids));
+      except
+        SteamBusy := False;
+      end;
+    finally LeaveCriticalSection(SteamCS); end;
+  except
+    ExportFailed('Steam_Tick');
+  end;
 end;
 
 { what Steam knows about one profile, as one line for the script to split }
@@ -746,34 +779,39 @@ var
   R, Created, Age: string;
 begin
   R := '';
-  if GrabProfiles(20) then
   try
-    if (Index >= 0) and (Index < ProfileCount) and (Profiles[Index].Steam.Fetched > 0) then
-    begin
-      if Profiles[Index].Steam.Created > 0 then
+    if GrabProfiles(20) then
+    try
+      if (Index >= 0) and (Index < ProfileCount) and (Profiles[Index].Steam.Fetched > 0) then
       begin
-        Created := FormatDateTime('yyyy-mm-dd', Profiles[Index].Steam.Created);
-        Age := IntToStr(Trunc(Now - Profiles[Index].Steam.Created));
-      end
-      else
-      begin
-        Created := '?';
-        Age := '-1';
+        if Profiles[Index].Steam.Created > 0 then
+        begin
+          Created := FormatDateTime('yyyy-mm-dd', Profiles[Index].Steam.Created);
+          Age := IntToStr(Trunc(Now - Profiles[Index].Steam.Created));
+        end
+        else
+        begin
+          Created := '?';
+          Age := '-1';
+        end;
+        { the dates are written out here: the script has no float to read them with }
+        R := string(Profiles[Index].Steam.SteamId) + '|' +
+             FieldText(Utf8ToConsole(string(Profiles[Index].Steam.Persona)), '|') + '|' +
+             string(Profiles[Index].Steam.Country) + '|' +
+             Created + '|' + Age + '|' +
+             IntToStr(Profiles[Index].Steam.Visible) + '|' +
+             IntToStr(Profiles[Index].Steam.VacBans) + '|' +
+             IntToStr(Profiles[Index].Steam.GameBans) + '|' +
+             IntToStr(Profiles[Index].Steam.CommunityBan) + '|' +
+             IntToStr(Profiles[Index].Steam.TradeBan) + '|' +
+             IntToStr(Profiles[Index].Steam.DaysSinceLastBan) + '|' +
+             FormatDateTime('yyyy-mm-dd hh:nn', Profiles[Index].Steam.Fetched);
       end;
-      { the dates are written out here: the script has no float to read them with }
-      R := string(Profiles[Index].Steam.SteamId) + '|' +
-           Utf8ToConsole(string(Profiles[Index].Steam.Persona)) + '|' +
-           string(Profiles[Index].Steam.Country) + '|' +
-           Created + '|' + Age + '|' +
-           IntToStr(Profiles[Index].Steam.Visible) + '|' +
-           IntToStr(Profiles[Index].Steam.VacBans) + '|' +
-           IntToStr(Profiles[Index].Steam.GameBans) + '|' +
-           IntToStr(Profiles[Index].Steam.CommunityBan) + '|' +
-           IntToStr(Profiles[Index].Steam.TradeBan) + '|' +
-           IntToStr(Profiles[Index].Steam.DaysSinceLastBan) + '|' +
-           FormatDateTime('yyyy-mm-dd hh:nn', Profiles[Index].Steam.Fetched);
-    end;
-  finally UnlockProfiles; end;
+    finally UnlockProfiles; end;
+  except
+    ExportFailed('Get_Steam_Info');
+    R := '';
+  end;
   TempStringResult := R;
   Result := PChar(TempStringResult);
 end;

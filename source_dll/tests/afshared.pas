@@ -82,6 +82,7 @@ var
   Names0: array of AnsiString;
   Same: Boolean;
   S: AnsiString;
+  Seq0: Int64;
 
 procedure Check(const Name: string; Ok: Boolean);
 begin
@@ -399,6 +400,31 @@ begin
     B.AddTime(Ib, 45, 0);
     Check('play time on both servers adds up (server 11)', WaitFor(A, 'S777001', 135));
     Check('play time on both servers adds up (server 12)', WaitFor(B, 'S777001', 135));
+  end;
+
+  { ---- 3b. many accounts changed at once: they go in 200 per exchange, each part in a
+    transaction of its own (one transaction held the lock on 'seq' for all of them, and the
+    other servers' exchanges failed meanwhile), and every one of them arrives ---- }
+  if (A.Count() >= 450) and (B.Count() >= 450) then
+  begin
+    Seq0 := StrToInt64Def(Scalar('SELECT value FROM af_db_meta WHERE name = ''seq'''), 0);
+    for i := 0 to 449 do A.AddTime(i, 1, 0);
+    k := 0;
+    repeat
+      Same := True;
+      for i := 0 to 449 do
+        if TimeOf(B, i) <> TimeOf(A, i) then
+        begin
+          Same := False;
+          Break;
+        end;
+      if Same then Break;
+      Sleep(100);
+      Inc(k);
+    until k > 300;
+    Check('450 accounts changed at once all reach server 12', Same);
+    S := Scalar('SELECT COUNT(DISTINCT seq) FROM af_db_profiles WHERE seq > ' + IntToStr(Seq0));
+    Check('and they went in at most 200 per exchange (' + S + ' exchanges)', StrToIntDef(S, 0) >= 3);
   end;
 
   { ---- 4. the decisions of the admins ---- }

@@ -162,6 +162,10 @@ var
   Said: AnsiString;
   { the audit of 2026-09-23 }
   AuditIni, LongName, Line: AnsiString;
+  { the audit of 2026-10-06 }
+  LogLine: TPathProc;
+  LogMark, LogText: AnsiString;
+  LogWait: Integer;
   LoginResult: TVisitCount;
   ProfileHwid, PlayedOf: TNameOf;
   AddTime: TAddTime;
@@ -177,6 +181,7 @@ var
   R3Db: AnsiString;
   RGhost, REcho, RDelta, RAlpha, RCharlie, RBravo: LongInt;
   RHash1, RHashKowal, RAt2, RCaret1, RTopGun, RTop, RCount, RBigTime, RBig, RHash99, RDots: LongInt;
+  RSchoolA, RSchoolB: LongInt;
 
   { settings.ini for one test: the given lines, and nothing else }
   procedure UseIni(const Text: array of AnsiString);
@@ -627,8 +632,21 @@ begin
   begin
     Check('a Swedish name keeps its letters',
       StrPas(Conv(PChar(#$56#$C3#$A4#$73#$74#$65#$72))) = 'V' + Chr($E4) + 'ster');
-    Check('a Polish name gets plain letters where the console has none',
+    { MysqlCodepage = 1250 (the default): the text is kept in that code page, every Polish
+      letter has its byte }
+    Check('a Polish name keeps its letters in code page 1250',
+      StrPas(Conv(PChar(#$C5#$81#$C3#$B3#$64#$C5#$BA))) = Chr($A3) + Chr($F3) + 'd' + Chr($9F));
+    Lines := TStringList.Create;
+    try
+      Lines.Add('[MySQL]');
+      Lines.Add('MysqlCodepage = 1252');
+      Lines.SaveToFile(IniPath);
+    finally Lines.Free; end;
+    LoadIni(PChar(IniPath));
+    DeleteFile(IniPath);
+    Check('with the Western code page a Polish name gets plain letters where it has none',
       StrPas(Conv(PChar(#$C5#$81#$C3#$B3#$64#$C5#$BA))) = 'L' + Chr($F3) + 'dz');
+    LoadIni(PChar('does-not-exist.ini'));
     Check('plain ascii is left alone', StrPas(Conv(PChar('Vannas 123'))) = 'Vannas 123');
     Check('a sign the console has no letter for becomes a question mark',
       StrPas(Conv(PChar(#$E4#$B8#$AD))) = '?');
@@ -1199,7 +1217,7 @@ begin
       end;
     Check('every line of the help of a player fits 100 letters', Ok);
     Check('the help ends with the version and its author',
-      (Lines.Count > 0) and (Pos('AntiFake Extended 2.0 by TryHackX', Lines[Lines.Count - 1]) > 0));
+      (Lines.Count > 0) and (Pos('AntiFake Extended 2.1 by TryHackX', Lines[Lines.Count - 1]) > 0));
   finally Lines.Free; end;
   Check('a player is shown the pages once, with !',
     (Occurs('!af_next', Said) = 1) and (Pos('/af_next', Said) = 0));
@@ -1533,6 +1551,34 @@ begin
     (Pos('Account #' + IntToStr(RHash1) + ' ', Said) > 0) and (Pos('is account #1', Said) = 0));
   Said := AskAll(28, 'statusa', '"#1"', True);
   Check('the same for /statusa', Pos('Account #' + IntToStr(RHash1) + ': #1', Said) > 0);
+
+  { the ties of an account are what /multi tells: PlayerMulti decides who sees them in a status,
+    not PlayerStatus (a player saw the accounts of strangers from one school address) }
+  RSchoolA := LoginPlayer('SchoolA', '', 'HW-R3-SA', '53.0.0.1', True);
+  RSchoolB := LoginPlayer('SchoolB', '', 'HW-R3-SB', '53.0.0.1', True);
+  SetOnline(20, RSchoolA, PChar('SchoolA'), PChar('53.0.0.1'), PChar('HW-R3-SA'), False);
+  UseIni(['CommandCooldownSeconds = 0', 'HeavyCooldownSeconds = 0', 'MaxListsPerSecond = 60',
+    'PlayerStatus = self', 'PlayerMulti = off']);
+  Said := AskAll(20, '!mystatus', '', False);
+  Check('!mystatus of a player without /multi says nothing of the accounts tied to theirs',
+    (Pos('Account #' + IntToStr(RSchoolA) + ': SchoolA', Said) > 0) and (Pos('SchoolB', Said) = 0) and
+    (Pos('Looks like one person', Said) = 0) and (Pos('share something', Said) = 0));
+  Said := AskAll(28, 'statusa', '#' + IntToStr(RSchoolA), True);
+  Check('an admin sees them', Pos('SchoolB', Said) > 0);
+  UseIni(['CommandCooldownSeconds = 0', 'HeavyCooldownSeconds = 0', 'MaxListsPerSecond = 60',
+    'PlayerStatus = self', 'PlayerMulti = self']);
+  Said := AskAll(20, '!mystatus', '', False);
+  Check('with PlayerMulti = self the player sees the account behind the same address (from the index)',
+    Pos('SchoolB', Said) > 0);
+  ClearOnline(20);
+
+  { the game console of Soldat 1.7.1 reads UTF-8: a letter kept in one byte goes out as UTF-8
+    ("Poland, ?wilcza" in !locate), and a name that is UTF-8 already stays so }
+  n := LoginPlayer('SwTest', '', 'HW-SWT', '10.9.8.7', True);
+  VisitNote(n, PChar(#$C5#$9A'wilcza'), PChar('HW-SWT'), PChar('10.9.8.7'), 60);
+  Said := AskAll(29, 'visits', '#' + IntToStr(n), True);
+  Check('a Polish letter reaches the console as UTF-8, never as a byte of its own',
+    (Pos(#$C5#$9A'wilcza', Said) > 0) and (Pos(Chr($8C) + 'wilcza', Said) = 0));
   Said := AskAll(28, 'multi', '#99999', True);
   Check('a #number no account has takes the player of that name, and says so',
     (Pos('There is no account #99999: the player named #99999 (account #' + IntToStr(RHash99) + ') was taken.', Said) > 0) and
@@ -1598,6 +1644,29 @@ begin
   Check('the help says how to name a player whose name looks like #1, and the sorts of the list',
     (Pos('a name in double quotes is always a name', Said) > 0) and
     (Pos('/listprofiles [sort] [asc|desc]', Said) > 0) and (Pos('listprofiles sort = id, name', Said) > 0));
+  { AFW-11: a control character (an escape sequence of a terminal) in a log line is written as ?,
+    so whoever reads the log with cat or tail sees no lines painted over }
+  LogLine := TPathProc(GetProcedureAddress(Lib, 'Log_Line'));
+  LogMark := 'afw11-' + IntToStr(GetTickCount64);
+  LogLine(PChar(LogMark + ' x' + #27 + '[2K' + #7 + 'y'));
+  LogText := '';
+  for LogWait := 1 to 60 do
+  begin
+    Sleep(100);
+    try
+      with TStringList.Create do
+      try
+        LoadFromFile('logs' + DirectorySeparator + 'antifake' + DirectorySeparator + 'antifake.log');
+        LogText := Text;
+      finally Free; end;
+    except
+      LogText := '';
+    end;
+    if Pos(LogMark, LogText) > 0 then Break;
+  end;
+  Check('a control character of a log line is written as ? (no escape sequence in antifake.log)',
+    (Pos(LogMark + ' x?[2K?y', LogText) > 0) and (Pos(#27, LogText) = 0));
+
   LoadIni(PChar('does-not-exist.ini'));
   if FileExists(R3Db) then DeleteFile(R3Db);
 

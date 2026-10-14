@@ -31,6 +31,7 @@ begin
   Settings.MysqlDatabase := 'soldat';
   Settings.MysqlUser := '';
   Settings.MysqlPassword := '';
+  Settings.MysqlServerKey := '';
   Settings.MysqlServerId := 1;
   Settings.MysqlMinutes := 60;
   Settings.SyncSeconds := 3;
@@ -221,7 +222,7 @@ begin
   else if K = 'maxlistspersecond' then Settings.MaxListsPerSecond := SettingInt(Value, 3, 1, 60, Bad)
   else if K = 'publiccommands' then Settings.PublicCommands := SettingBool(Value, True, Bad)
   else if K = 'trace' then Settings.Trace := SettingBool(Value, False, Bad)
-  else if K = 'linespertick' then Settings.LinesPerTick := SettingInt(Value, 4, 1, 30, Bad)
+  else if K = 'linespertick' then Settings.LinesPerTick := SettingInt(Value, 4, 1, 10, Bad)
   else if K = 'maxqueuedlines' then Settings.MaxQueuedLines := SettingInt(Value, 200, 20, 2000, Bad)
   else if K = 'activedays' then Settings.ActiveDays := SettingInt(Value, DEF_ACTIVE_DAYS, 0, 3650, Bad)
   else if K = 'journalseconds' then Settings.JournalSeconds := SettingInt(Value, 10, 0, 3600, Bad)
@@ -238,6 +239,7 @@ begin
   else if K = 'mysqldatabase' then Settings.MysqlDatabase := Trim(Value)
   else if K = 'mysqluser' then Settings.MysqlUser := Trim(Value)
   else if K = 'mysqlpassword' then Settings.MysqlPassword := SettingSecret(Value)
+  else if K = 'mysqlserverkey' then Settings.MysqlServerKey := SettingSecret(Value)
   else if K = 'mysqlserverid' then Settings.MysqlServerId := SettingInt(Value, 1, 1, 100000, Bad)
   else if K = 'mysqlminutes' then Settings.MysqlMinutes := SettingInt(Value, 60, 1, 10080, Bad)
   else if K = 'syncseconds' then Settings.SyncSeconds := SettingInt(Value, 3, 1, 60, Bad)
@@ -290,7 +292,9 @@ begin
   else if K = 'steamrefreshdays' then Settings.SteamRefreshDays := SettingInt(Value, DEF_STEAM_REFRESH_DAYS, 1, 365, Bad)
   else if K = 'steambatchsize' then Settings.SteamBatch := SettingInt(Value, DEF_STEAM_BATCH, 1, 100, Bad)
   else if K = 'steamcurlpath' then Settings.CurlPath := Trim(Value)
-  else if K = 'steamtimeoutseconds' then Settings.CurlTimeoutSeconds := SettingInt(Value, 10, 2, 120, Bad)
+  { at most 30: a question to Steam that hangs is waited for that long, and every second of it
+    is a second the end of the server may have to wait }
+  else if K = 'steamtimeoutseconds' then Settings.CurlTimeoutSeconds := SettingInt(Value, 10, 2, 30, Bad)
   else if K = 'addressdays' then Settings.AddressDays := SettingInt(Value, DEF_ADDRESS_DAYS, 0, 3650, Bad)
   else if K = 'namedays' then Settings.NameDays := SettingInt(Value, DEF_NAME_DAYS, 0, 3650, Bad)
   else if K = 'hwiddays' then Settings.HwidDays := SettingInt(Value, DEF_HWID_DAYS, 0, 3650, Bad)

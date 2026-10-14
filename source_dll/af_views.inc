@@ -770,7 +770,10 @@ begin
   Steam := SteamLineOf(Idx);
   if Steam <> '' then Say(Slot, CLR_MAIN, Pad('Steam', 14, 0) + ': ' + Steam);
 
-  Line := MultiSummaryOf(Idx);
+  { the ties are for a viewer who may ask /multi about this account (the search left them out
+    for anybody else, and the summary below would tell them all the same) }
+  Line := '';
+  if R^.Kind <> STATUS_TIES_NONE then Line := MultiSummaryOf(Idx);
   if Line <> '' then
   begin
     SaySection(Slot, 'Looks like one person with');

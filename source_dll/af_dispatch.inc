@@ -465,7 +465,7 @@ var
 begin
   if (What = 'backups') or (What = 'copies') then
   begin
-    Files := ListBackupFiles(LoadedPath);
+    Files := ListBackupFiles(CurrentDbPath);
     try
       if Files.Count = 0 then
       begin
@@ -518,7 +518,7 @@ begin
     Exit;
   end;
   SayHeader(Slot, 'Storage');
-  Say(Slot, CLR_MAIN, Pad('File', 10, 0) + ': ' + LoadedPath);
+  Say(Slot, CLR_MAIN, Pad('File', 10, 0) + ': ' + CurrentDbPath);
   Say(Slot, CLR_MAIN, Pad('Journal', 10, 0) + ': ' + JournalStatusText);
   Say(Slot, CLR_MAIN, Pad('MySQL', 10, 0) + ': ' + MysqlStatusText);
   { BackupHours = 0 means no copies at all, not "every 0 h" }

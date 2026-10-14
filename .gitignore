@@ -1,0 +1,6 @@
+# compiled script bytecode and debug info of ScriptCore
+*.psb
+*.psd
+# build output of build.bat / build.sh
+source_dll/build/
+*.so.new
