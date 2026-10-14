@@ -25,6 +25,19 @@ var
   GeoPauseUntil: QWord = 0;     { no lookup starts before this }
   GeoPauseStep: Integer = 0;    { lookups without an answer in a row }
 
+procedure TraceStep(const Step: string); forward;
+
+{ a text for the trace with every byte above 127 as <XX>: the letters of a place as they came }
+function TraceBytes(const S: string): string;
+var
+  k: Integer;
+begin
+  Result := '';
+  for k := 1 to Length(S) do
+    if Byte(S[k]) > 127 then Result := Result + '<' + IntToHex(Byte(S[k]), 2) + '>'
+    else Result := Result + S[k];
+end;
+
 procedure StartGeoLookup(const IP: string);
 var
   k: Integer;
@@ -47,6 +60,7 @@ begin
     k := GeoFailed.IndexOfName(IP);
     if (k >= 0) and (Int64(T div 1000) - StrToInt64Def(GeoFailed.ValueFromIndex[k], 0) < Settings.GeoRetrySeconds) then Exit;
     GeoPending.Add(IP);
+    if Settings.Trace then TraceStep('geo lookup of ' + IP + ' started');
     Inc(GeoThreadsRunning);
     try
       StartBackground(TGeoThread.Create(IP));
@@ -164,10 +178,104 @@ begin
   FIP := TargetIP;
 end;
 
+{ The text of one string field of the flat object ip-api.com answers with, as UTF-8 bytes, read
+  byte by byte out of the body. No conversion of the run time library touches it: on a Linux
+  server without a locale the letters outside ASCII came out as "?" ("Poland, ?wilcza"). Def when
+  the field is not there or is not a string. }
+function JsonField(const Body, Name, Def: string): string;
+var
+  p, n: Integer;
+  u: LongWord;
+begin
+  Result := Def;
+  p := Pos('"' + Name + '":', Body);
+  if p = 0 then Exit;
+  p := p + Length(Name) + 3;
+  n := Length(Body);
+  while (p <= n) and (Body[p] = ' ') do Inc(p);
+  if (p > n) or (Body[p] <> '"') then Exit;
+  Inc(p);
+  Result := '';
+  while p <= n do
+  begin
+    if Body[p] = '"' then Exit;
+    if (Body[p] = '\') and (p < n) then
+    begin
+      Inc(p);
+      case Body[p] of
+        'u':
+          if p + 4 <= n then
+          begin
+            u := StrToIntDef('$' + Copy(Body, p + 1, 4), 63);
+            Inc(p, 4);
+            { half of a pair beyond U+FFFF: no letter of a place }
+            if (u >= $D800) and (u <= $DFFF) then u := 63;
+            if u < $80 then Result := Result + Chr(u)
+            else if u < $800 then Result := Result + Chr($C0 or (u shr 6)) + Chr($80 or (u and $3F))
+            else Result := Result + Chr($E0 or (u shr 12)) + Chr($80 or ((u shr 6) and $3F)) + Chr($80 or (u and $3F));
+          end;
+        'n', 'r', 't', 'b', 'f': Result := Result + ' ';
+      else
+        Result := Result + Body[p];
+      end;
+    end
+    else
+      Result := Result + Body[p];
+    Inc(p);
+  end;
+  { no closing quote: a broken answer }
+  Result := Def;
+end;
+
+{ The object of a JSON answer that holds "Key":"Value" and no other object, as raw bytes: the
+  entry of one player in the answer of Steam. Strings are skipped whole, so a brace in a name
+  does not count. '' when there is none. }
+function JsonObjectWith(const Body, Key, Value: string): string;
+var
+  p, n, Depth: Integer;
+  InStr: Boolean;
+  Starts: array of Integer;
+  Part: string;
+begin
+  Result := '';
+  n := Length(Body);
+  Depth := 0;
+  InStr := False;
+  SetLength(Starts, 0);
+  p := 1;
+  while p <= n do
+  begin
+    if InStr then
+    begin
+      if Body[p] = '\' then Inc(p)
+      else if Body[p] = '"' then InStr := False;
+    end
+    else if Body[p] = '"' then InStr := True
+    else if Body[p] = '{' then
+    begin
+      Inc(Depth);
+      SetLength(Starts, Depth);
+      Starts[Depth - 1] := p;
+    end
+    else if (Body[p] = '}') and (Depth > 0) then
+    begin
+      Part := Copy(Body, Starts[Depth - 1], p - Starts[Depth - 1] + 1);
+      Dec(Depth);
+      if Pos('"' + Key + '":"' + Value + '"', Part) > 0 then
+      begin
+        Result := Part;
+        Exit;
+      end;
+    end;
+    Inc(p);
+  end;
+end;
+
 procedure TGeoThread.Execute;
 var
   Client: TGeoClient;
   Response: string;
+  Body: TMemoryStream;
   JData: TJSONData;
   JObj: TJSONObject;
   Idx, Pause: Integer;
@@ -185,7 +293,16 @@ begin
   Client.OnGetSocketHandler := @Client.GiveSocket;
   try
     try
-      Response := Client.Get('http://ip-api.com/json/' + FIP + '?fields=20181819');
+      { the bytes of the body as they came over the wire }
+      Body := TMemoryStream.Create;
+      try
+        Client.Get('http://ip-api.com/json/' + FIP + '?fields=20181819', Body);
+        Response := '';
+        SetLength(Response, Body.Size);
+        if Body.Size > 0 then Move(Body.Memory^, Response[1], Body.Size);
+      finally
+        Body.Free;
+      end;
       { the last question of the service's minute: the next lookup waits for the next one }
       if GeoHeader(Client.ResponseHeaders, 'X-Rl') = '0' then
         Pause := GeoTtl(Client.ResponseHeaders);
@@ -211,18 +328,21 @@ begin
             end;
 
             with GeoCache[Idx] do begin
-              SetGeoString(Continent, Utf8Bytes(JObj.Get('continent', 'UNK')));
-              SetGeoString(ContinentCode, Utf8Bytes(JObj.Get('continentCode', 'UNK')));
+              SetGeoString(Continent, JsonField(Response, 'continent', 'UNK'));
+              SetGeoString(ContinentCode, JsonField(Response, 'continentCode', 'UNK'));
 
-              SetGeoString(Country, Utf8Bytes(JObj.Get('country', 'Unknown')));
-              SetGeoString(CountryCode, Utf8Bytes(JObj.Get('countryCode', '??')));
-              SetGeoString(Region, Utf8Bytes(JObj.Get('regionName', 'Unknown')));
-              SetGeoString(City, Utf8Bytes(JObj.Get('city', 'Unknown')));
-              SetGeoString(Zip, Utf8Bytes(JObj.Get('zip', '')));
+              SetGeoString(Country, JsonField(Response, 'country', 'Unknown'));
+              SetGeoString(CountryCode, JsonField(Response, 'countryCode', '??'));
+              SetGeoString(Region, JsonField(Response, 'regionName', 'Unknown'));
+              SetGeoString(City, JsonField(Response, 'city', 'Unknown'));
+              if Settings.Trace then
+                TraceStep('geo answer for ' + FIP + ': city ' + TraceBytes(JsonField(Response, 'city', '')) +
+                  ' (fpjson: ' + TraceBytes(Utf8Bytes(JObj.Get('city', ''))) + '), kept as ' + TraceBytes(string(City)));
+              SetGeoString(Zip, JsonField(Response, 'zip', ''));
 
-              SetGeoString(ISP, Utf8Bytes(JObj.Get('isp', 'Unknown')));
-              SetGeoString(ReverseDNS, Utf8Bytes(JObj.Get('reverse', '')));
-              SetGeoString(Timezone, Utf8Bytes(JObj.Get('timezone', '')));
+              SetGeoString(ISP, JsonField(Response, 'isp', 'Unknown'));
+              SetGeoString(ReverseDNS, JsonField(Response, 'reverse', ''));
+              SetGeoString(Timezone, JsonField(Response, 'timezone', ''));
 
               if JObj.Get('mobile', False) then IsMobile := 1 else IsMobile := 0;
               if JObj.Get('proxy', False) then IsProxy := 1 else IsProxy := 0;
@@ -245,6 +365,10 @@ begin
     except
       { refused for asking too often (429: as long as it says), or no answer at all: every
         lookup waits, longer after every failure in a row }
+      if Settings.Trace then
+        if ExceptObject is Exception then
+          TraceStep('geo lookup of ' + FIP + ' failed (HTTP ' + IntToStr(Client.ResponseStatusCode) + '): ' +
+            Exception(ExceptObject).Message);
       if Client.ResponseStatusCode = 429 then
         Pause := GeoTtl(Client.ResponseHeaders)
       else

@@ -700,7 +700,8 @@ The programs in `source_dll/tests` test the library without a game server: `afte
 The folder has to be `AntiFake-Extended`, not `AntiFake Extended`.
 
 **The server stops answering.** The script prints no trace of its own. `[Diagnostics] Trace = 1`
-writes every step of a login and of a correction to `logs/antifake/trace.log`, with times, so
+writes every step of a login, of a correction and of a lookup of a place to
+`logs/antifake/trace.log`, with times, so
 the last line says where it stopped. (`logs/antifake/antifake.log`, the events and the admin
 commands, is always written.)
 
@@ -767,11 +768,12 @@ together (delete `antifake.psb`); an old `settings.ini` works as it is, the new 
 - **MySQL:** `MysqlServerKey` (the server's RSA public key) keeps the password from somebody
   on the way; limits on the key and on the size of an answer. The mirror keeps two visits of one
   account from the same second as two rows.
-- **Letters of places and Steam names:** the game console of Soldat 1.7.1 reads UTF-8, and a
-  letter outside plain ASCII (`Swilcza` with its accent) was drawn as `?`. Every line now
-  leaves the library as UTF-8, and with `MysqlCodepage = 1250` (the default) the Polish letters
-  of places and Steam names are kept. A place an older version kept with a `?` is looked up again
-  once per start, at the next join from its address.
+- **Letters of places and Steam names:** on a Linux server without a locale every letter
+  outside plain ASCII of a place or a Steam name became `?` (`Poland, ?wilcza`), and on Windows
+  it lost its accent. The answers are now read byte for byte, and with `MysqlCodepage = 1250`
+  (the default) the Polish letters are kept in the code page the game console draws for Polish
+  players. A place an older version kept with a `?` is looked up again once per start, at the
+  next join from its address. `[Diagnostics] Trace = 1` also writes every lookup of a place.
 - **Geo:** an answer over 16 KB is refused, one lookup ends after twice `TimeoutMs`, a pause
   ip-api.com asks for is 5 minutes at most, and control characters of an answer (seen in the
   public "joined from" line) become spaces. Control characters of names are written as `?` in

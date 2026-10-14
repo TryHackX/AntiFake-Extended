@@ -189,7 +189,7 @@ end;
 
 procedure TSteamThread.Execute;
 var
-  Answer, Id, Problem, Key: string;
+  Answer, Id, Problem, Key, Raw: string;
   Got, Code: Integer;
   JData, Node, Item: TJSONData;
   Arr: TJSONArray;
@@ -242,8 +242,11 @@ begin
                 begin
                   SharedTouch(Idx);
                   SetGeoString(Profiles[Idx].Steam.SteamId, Id);
-                  SetGeoString(Profiles[Idx].Steam.Persona, Utf8Bytes(Obj.Get('personaname', '')));
-                  SetGeoString(Profiles[Idx].Steam.Country, Utf8Bytes(Obj.Get('loccountrycode', '')));
+                  { the name as the raw answer has it: fpjson on Linux without a locale made "?" of
+                    every letter outside ASCII }
+                  Raw := JsonObjectWith(Answer, 'steamid', Id);
+                  SetGeoString(Profiles[Idx].Steam.Persona, JsonField(Raw, 'personaname', Utf8Bytes(Obj.Get('personaname', ''))));
+                  SetGeoString(Profiles[Idx].Steam.Country, JsonField(Raw, 'loccountrycode', ''));
                   Created := Obj.Get('timecreated', 0);
                   if Created > 0 then Profiles[Idx].Steam.Created := UnixToDateTime(Created);
                   if Obj.Get('communityvisibilitystate', 1) = 3 then

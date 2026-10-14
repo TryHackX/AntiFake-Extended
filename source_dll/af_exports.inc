@@ -1138,7 +1138,6 @@ begin
     ExportFailed('Get_Maintenance_Report');
     TempStringResult := '';
   end;
-  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;
 
@@ -1256,7 +1255,6 @@ begin
     ExportFailed('Notice_Line');
     TempStringResult := '';
   end;
-  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;
 
@@ -1275,7 +1273,6 @@ begin
     ExportFailed('Get_Load_Note');
     TempStringResult := '';
   end;
-  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;
 
@@ -1340,12 +1337,23 @@ begin
     NeedsUpdate := False;
 
     { called at every join, on the game thread: it asks again at the next join rather than wait }
-    if not GrabLock(GeoCritSec, 5) then Exit;
+    if not GrabLock(GeoCritSec, 5) then
+    begin
+      if Settings.Trace then TraceStep('geo check of ' + SIP + ': busy, asked at the next join');
+      Exit;
+    end;
     try
       Idx := FindGeoIndex(SIP);
       if Idx = -1 then NeedsUpdate := True
       else if (Now - GeoCache[Idx].LastUpdated) > Settings.GeoRefreshDays then NeedsUpdate := True
       else if GeoAskAgain(Idx, SIP) then NeedsUpdate := True;
+      if Settings.Trace then
+        if Idx = -1 then
+          TraceStep('geo check of ' + SIP + ': not known yet')
+        else if NeedsUpdate then
+          TraceStep('geo check of ' + SIP + ': ' + TraceBytes(string(GeoCache[Idx].City)) + ', asked again')
+        else
+          TraceStep('geo check of ' + SIP + ': ' + TraceBytes(string(GeoCache[Idx].City)) + ', kept');
     finally
       LeaveCriticalSection(GeoCritSec);
     end;

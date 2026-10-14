@@ -1093,7 +1093,6 @@ begin
     ExportFailed('Out_Line');
     TempStringResult := '';
   end;
-  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;
 
@@ -1326,6 +1325,5 @@ begin
   except
     ExportFailed('Multi_Notice');
   end;
-  TempStringResult := ConsoleText(TempStringResult);
   Result := PChar(TempStringResult);
 end;

@@ -4,61 +4,11 @@
 
 { The code page of the text the library keeps and draws its tables in, one byte a letter: the
   Central European one when the names of the players come in it (MysqlCodepage = 1250, every
-  Polish letter has its byte there), else the Western one. }
+  Polish letter has its byte there), else the Western one. The game console draws one byte per
+  letter in the code page of the player's Windows, so the lines go out in it as they are. }
 function ConsoleCodepage: Integer;
 begin
   if Settings.MysqlCodepage = 1250 then Result := 1250 else Result := 1252;
-end;
-
-{ A line on its way to the game console. Soldat 1.7.1 reads the console as UTF-8 (the client
-  and the server set their code page to UTF-8), and a byte above 127 on its own was drawn as
-  "?" ("Poland, ?wilcza"). A byte of ConsoleCodepage becomes its UTF-8; UTF-8 that is in the
-  line already (a name as the server gave it) stays as it is. }
-function ConsoleText(const S: string): string;
-var
-  i, n, Need, k: Integer;
-  B: Byte;
-  Valid, Plain: Boolean;
-begin
-  Plain := True;
-  for i := 1 to Length(S) do
-    if Byte(S[i]) >= $80 then
-    begin
-      Plain := False;
-      Break;
-    end;
-  if Plain then Exit(S);
-  Result := '';
-  n := Length(S);
-  i := 1;
-  while i <= n do
-  begin
-    B := Byte(S[i]);
-    if B < $80 then
-    begin
-      Result := Result + S[i];
-      Inc(i);
-      Continue;
-    end;
-    if (B and $E0) = $C0 then Need := 1
-    else if (B and $F0) = $E0 then Need := 2
-    else if (B and $F8) = $F0 then Need := 3
-    else Need := 0;
-    Valid := (Need > 0) and (i + Need <= n);
-    if Valid then
-      for k := 1 to Need do
-        if (Byte(S[i + k]) and $C0) <> $80 then Valid := False;
-    if Valid then
-    begin
-      Result := Result + Copy(S, i, Need + 1);
-      Inc(i, Need + 1);
-    end
-    else
-    begin
-      Result := Result + CodepageToUtf8(S[i], ConsoleCodepage);
-      Inc(i);
-    end;
-  end;
 end;
 
 { The bytes of a text of fpjson (UTF-8) in a plain string, and of an answer in a UTF-8 string,
@@ -128,7 +78,7 @@ begin
     end;
     Inc(i);
     { a letter the code page of the console has keeps its own byte (with 1250 the Polish ones;
-      ConsoleText makes it UTF-8 again on the way out) }
+      it goes out to the game console as it is) }
     Ch := '';
     if (CP >= $80) and (CP <> $A0) and not Settings.GeoTextPlain then
     begin

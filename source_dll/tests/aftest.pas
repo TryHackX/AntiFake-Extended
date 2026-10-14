@@ -1572,13 +1572,13 @@ begin
     Pos('SchoolB', Said) > 0);
   ClearOnline(20);
 
-  { the game console of Soldat 1.7.1 reads UTF-8: a letter kept in one byte goes out as UTF-8
-    ("Poland, ?wilcza" in !locate), and a name that is UTF-8 already stays so }
+  { the game console draws one byte per letter in the code page of the player's Windows: a Polish
+    letter goes out as its byte of 1250 (UTF-8 was drawn as two letters, "Poland, ?wilcza") }
   n := LoginPlayer('SwTest', '', 'HW-SWT', '10.9.8.7', True);
   VisitNote(n, PChar(#$C5#$9A'wilcza'), PChar('HW-SWT'), PChar('10.9.8.7'), 60);
   Said := AskAll(29, 'visits', '#' + IntToStr(n), True);
-  Check('a Polish letter reaches the console as UTF-8, never as a byte of its own',
-    (Pos(#$C5#$9A'wilcza', Said) > 0) and (Pos(Chr($8C) + 'wilcza', Said) = 0));
+  Check('a Polish letter reaches the console as its byte of code page 1250',
+    (Pos(Chr($8C) + 'wilcza', Said) > 0) and (Pos(#$C5#$9A'wilcza', Said) = 0));
   Said := AskAll(28, 'multi', '#99999', True);
   Check('a #number no account has takes the player of that name, and says so',
     (Pos('There is no account #99999: the player named #99999 (account #' + IntToStr(RHash99) + ') was taken.', Said) > 0) and
