@@ -1217,7 +1217,7 @@ begin
       end;
     Check('every line of the help of a player fits 100 letters', Ok);
     Check('the help ends with the version and its author',
-      (Lines.Count > 0) and (Pos('AntiFake Extended 2.1 by TryHackX', Lines[Lines.Count - 1]) > 0));
+      (Lines.Count > 0) and (Pos('AntiFake Extended 2.1.1 by TryHackX', Lines[Lines.Count - 1]) > 0));
   finally Lines.Free; end;
   Check('a player is shown the pages once, with !',
     (Occurs('!af_next', Said) = 1) and (Pos('/af_next', Said) = 0));
@@ -1570,6 +1570,21 @@ begin
   Said := AskAll(20, '!mystatus', '', False);
   Check('with PlayerMulti = self the player sees the account behind the same address (from the index)',
     Pos('SchoolB', Said) > 0);
+  { but only what /multi would tell: an address more accounts share than MultiAccountMaxShared is
+    a public one, and with MultiAccountByAddress = 0 no address ties anybody }
+  LoginPlayer('SchoolC', '', 'HW-R3-SC', '53.0.0.1', True);
+  UseIni(['CommandCooldownSeconds = 0', 'HeavyCooldownSeconds = 0', 'MaxListsPerSecond = 60',
+    'PlayerStatus = self', 'PlayerMulti = self', 'MultiAccountMaxShared = 2']);
+  Said := AskAll(20, '!mystatus', '', False);
+  Check('an address shared by more accounts than MultiAccountMaxShared names nobody in a player''s status',
+    (Pos('Account #' + IntToStr(RSchoolA) + ': SchoolA', Said) > 0) and (Pos('SchoolB', Said) = 0));
+  UseIni(['CommandCooldownSeconds = 0', 'HeavyCooldownSeconds = 0', 'MaxListsPerSecond = 60',
+    'PlayerStatus = self', 'PlayerMulti = self', 'MultiAccountByAddress = 0']);
+  Said := AskAll(20, '!mystatus', '', False);
+  Check('nor any address with MultiAccountByAddress = 0',
+    (Pos('Account #' + IntToStr(RSchoolA) + ': SchoolA', Said) > 0) and (Pos('SchoolB', Said) = 0));
+  Said := AskAll(28, 'statusa', '#' + IntToStr(RSchoolA), True);
+  Check('an admin still sees the account of the same address', Pos('SchoolB', Said) > 0);
   ClearOnline(20);
 
   { the game console draws one byte per letter in the code page of the player's Windows: a Polish

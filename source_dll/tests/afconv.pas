@@ -93,7 +93,7 @@ var
   SR: TSearchRec;
   BackDir: AnsiString;
   Old, New1, IniPath, NanPath, Hwid1, Said, Before1, VisDb, VisJrn: AnsiString;
-  V1, V2, V3: LongInt;
+  V1, V2, V3, SteamA, SteamB: LongInt;
   Took: QWord;
   i, n, WasCount, Failures, Differ: LongInt;
   Snap1, Snap2: TStringList;
@@ -393,9 +393,20 @@ begin
 end;
 
 begin
-  { started as the "curl" of the Steam check below: a curl that never answers }
+  { started as the "curl" of the Steam checks below: with afconv-steam.json beside it a curl that
+    answers with that file (and the status 200), else a curl that never answers }
   if ParamStr(1) = '-s' then
   begin
+    Said := ExtractFilePath(ParamStr(0)) + 'afconv-steam.json';
+    if FileExists(Said) then
+    begin
+      Said := FileText(Said) + #10'200';
+      with THandleStream.Create(StdOutputHandle) do
+      try
+        WriteBuffer(Said[1], Length(Said));
+      finally Free; end;
+      Halt(0);
+    end;
     Sleep(60000);
     Halt(0);
   end;
@@ -741,6 +752,48 @@ begin
   DeleteFile(BackDir + PathDelim + 'antifake-20260101-000000.dat');
   RemoveDir(BackDir);
 
+  { Steam names with MysqlCodepage = 1250: kept in the bytes of 1250 and shown in them. A second
+    conversion on the way out read E-ogonek Z-dot ($CA $AF) and O-acute L-stroke ($D3 $A3) as one
+    UTF-8 letter each and drew "W?" and "G?". One answer holds both players (one written the way
+    Steam writes it, with white space, one compact), after a third whose name carries the text of
+    the first one's id: each name comes from its own object. The "curl" is this program,
+    answering with afconv-steam.json. }
+  SteamA := LoginPlayer('SteamWez', 'S1234567', 'HW-STEAM-A', '10.77.0.1', True);
+  SteamB := LoginPlayer('SteamGol', 'S1234568', 'HW-STEAM-B', '10.77.0.2', True);
+  PutFile(ExtractFilePath(ParamStr(0)) + 'afconv-steam.json',
+    '{"response":{"players":[' +
+    '{"steamid":"76561197961500299","personaname":"decoy \"steamid\":\"76561197961500295\" {"},' +
+    { Steam writes its answers with tabs, line breaks and a space after each colon }
+    '{'#10#9#9#9#9'"steamid": "76561197961500295",'#10#9#9#9#9'"personaname": "W'#$C4#$98#$C5#$BB' {\"x\"}",' +
+    #10#9#9#9#9'"loccountrycode": "PL"'#10#9#9#9'},' +
+    '{"steamid":"76561197961500296","personaname":"G\u00d3\u0141","loccountrycode":"PL"}]}}');
+  L := TStringList.Create;
+  try
+    L.Add('[MySQL]');
+    L.Add('MysqlCodepage = 1250');
+    L.Add('[Steam]');
+    L.Add('SteamApiKey = 0000000000000000000000000000TEST');
+    L.Add('SteamCurlPath = ' + ParamStr(0));
+    L.Add('SteamTimeoutSeconds = 10');
+    L.SaveToFile(IniPath);
+  finally L.Free; end;
+  LoadIni(PChar(IniPath));
+  SteamNote(PChar('S1234567'));
+  SteamNote(PChar('S1234568'));
+  SteamTick();
+  i := 0;
+  while (i < 250) and (Pos('answered 2', StrPas(SteamStatus())) = 0) do begin Sleep(20); Inc(i); end;
+  { the second question (bans) gets the same file and finds no players in it }
+  Sleep(1500);
+  Said := StrPas(SteamInfo(SteamA));
+  Check('a Steam name in 1250 comes out in its bytes (' + Said + ')',
+    (Pos('|W'#$CA#$AF' {"x"}|PL|', Said) > 0) and (Pos('decoy', Said) = 0));
+  Said := StrPas(SteamInfo(SteamB));
+  Check('a name of \u escapes too (' + Said + ')', Pos('|G'#$D3#$A3'|PL|', Said) > 0);
+  Said := Ask(3, 'steam', '#' + IntToStr(SteamA), True);
+  Check('and so does /steam', Pos('W'#$CA#$AF' {"x"}', Said) > 0);
+  DeleteFile(ExtractFilePath(ParamStr(0)) + 'afconv-steam.json');
+
   { /recompile or the end of the server while a question to Steam hangs: Cleanup stops it at
     once. It used to wait SteamTimeoutSeconds for curl (up to 120), and a thread still running
     after Cleanup ran on in a library that was unloaded under it. The "curl" is this program. }
@@ -758,6 +811,9 @@ begin
   i := 0;
   while (i < 250) and (Pos('waiting 0', StrPas(SteamStatus())) = 0) do begin Sleep(20); Inc(i); end;
   Sleep(1000);
+  { the question of the names check above answered 2; this one is asked and hangs }
+  Check('a question to Steam hangs now (' + StrPas(SteamStatus()) + ')',
+    (Pos('asked 3,', StrPas(SteamStatus())) > 0) and (Pos('answered 2,', StrPas(SteamStatus())) > 0));
   Took := GetTickCount64;
   Cleanup();
   Took := GetTickCount64 - Took;

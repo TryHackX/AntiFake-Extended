@@ -19,7 +19,7 @@ var
   CheckStr, MatchedStr: string;
   FoundProfiles, TargetNames, TargetSteams, TargetHWIDs, TargetIPs: TStringList;
   KeyLists, KeyIndexes: array[0..2] of TStringList;
-  KeyPos: Integer;
+  KeyPos, KeyEnd, KeyCap: Integer;
   TaskIsValid: Boolean;
   HasMatch, HasNameMatch: Boolean;
   TempNameCount: Integer;
@@ -890,11 +890,22 @@ begin
                       LockProfiles;
                       try
                          for k := 0 to 2 do
+                         begin
+                            { what /multi leaves out, this list does too (CollectLinks): addresses
+                              only with MultiAccountByAddress, and a key more accounts share than
+                              the limit - a school, a cafe - says nothing about anybody; it named
+                              strangers to a player with PlayerMulti = self }
+                            if (k = 2) and not Settings.MultiByAddress then Continue;
+                            if k = 2 then KeyCap := Settings.MultiMaxShared else KeyCap := Settings.MultiMaxSharedPC;
                             for j := 0 to KeyLists[k].Count - 1 do
                             begin
                                KeyPos := IndexFirst(KeyIndexes[k], KeyLists[k][j]);
-                               while (KeyPos >= 0) and (KeyPos < KeyIndexes[k].Count) and
-                                     (KeyIndexes[k][KeyPos] = KeyLists[k][j]) do
+                               if KeyPos < 0 then Continue;
+                               KeyEnd := KeyPos;
+                               while (KeyEnd < KeyIndexes[k].Count) and (KeyIndexes[k][KeyEnd] = KeyLists[k][j]) do
+                                  Inc(KeyEnd);
+                               if KeyEnd - KeyPos > KeyCap then Continue;
+                               while KeyPos < KeyEnd do
                                begin
                                   c := Integer(PtrInt(KeyIndexes[k].Objects[KeyPos]));
                                   if (c >= 0) and (c < ProfileCount) and (c <> FTask.TargetIndex) then
@@ -902,6 +913,7 @@ begin
                                   Inc(KeyPos);
                                end;
                             end;
+                         end;
                          { FoundProfiles is sorted: the accounts come in their order, as in the walk }
                          for j := 0 to FoundProfiles.Count - 1 do
                          begin

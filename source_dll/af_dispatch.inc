@@ -220,7 +220,7 @@ begin
       Exit;
     end;
     Id := string(Profiles[Idx].Steam.SteamId);
-    Persona := Utf8ToConsole(string(Profiles[Idx].Steam.Persona));
+    Persona := KeptToConsole(string(Profiles[Idx].Steam.Persona));
     Country := string(Profiles[Idx].Steam.Country);
     if Persona = '' then Persona := '(no name)';
     if Country = '' then Country := '??';

@@ -290,7 +290,7 @@ begin
   try
     if (Index < 0) or (Index >= ProfileCount) then Exit;
     if Profiles[Index].Steam.Fetched <= 0 then Exit;
-    Result := Utf8ToConsole(string(Profiles[Index].Steam.Persona));
+    Result := KeptToConsole(string(Profiles[Index].Steam.Persona));
     if string(Profiles[Index].Steam.Country) <> '' then
       Result := Result + ' (' + string(Profiles[Index].Steam.Country) + ')';
     if Profiles[Index].Steam.Created > 1 then

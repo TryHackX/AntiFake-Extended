@@ -178,6 +178,40 @@ begin
   FIP := TargetIP;
 end;
 
+{ Where the value of the first key Name at or after From begins: past the colon and the white
+  space JSON allows around it. 0 when there is none. Steam writes its answers with tabs, line
+  breaks and a space after every colon ("steamid": "7656..."); ip-api.com writes them without. }
+function JsonKeyEnd(const Body, Name: string; From: Integer): Integer;
+var
+  p, k, m, n: Integer;
+  Pat: string;
+begin
+  Result := 0;
+  Pat := '"' + Name + '"';
+  m := Length(Pat);
+  n := Length(Body);
+  if From < 1 then From := 1;
+  p := From;
+  while p + m - 1 <= n do
+  begin
+    k := 0;
+    while (k < m) and (Body[p + k] = Pat[k + 1]) do Inc(k);
+    if k = m then
+    begin
+      { a key is followed by its colon; the same text as a value is not }
+      k := p + m;
+      while (k <= n) and (Body[k] in [' ', #9, #10, #13]) do Inc(k);
+      if (k <= n) and (Body[k] = ':') then
+      begin
+        Inc(k);
+        while (k <= n) and (Body[k] in [' ', #9, #10, #13]) do Inc(k);
+        Exit(k);
+      end;
+    end;
+    Inc(p);
+  end;
+end;
+
 { The text of one string field of the flat object ip-api.com answers with, as UTF-8 bytes, read
   byte by byte out of the body. No conversion of the run time library touches it: on a Linux
   server without a locale the letters outside ASCII came out as "?" ("Poland, ?wilcza"). Def when
@@ -188,11 +222,9 @@ var
   u: LongWord;
 begin
   Result := Def;
-  p := Pos('"' + Name + '":', Body);
+  p := JsonKeyEnd(Body, Name, 1);
   if p = 0 then Exit;
-  p := p + Length(Name) + 3;
   n := Length(Body);
-  while (p <= n) and (Body[p] = ' ') do Inc(p);
   if (p > n) or (Body[p] <> '"') then Exit;
   Inc(p);
   Result := '';
@@ -225,6 +257,20 @@ begin
   end;
   { no closing quote: a broken answer }
   Result := Def;
+end;
+
+{ Part holds the key Key with the string Value, white space around the colon or not }
+function JsonHasPair(const Part, Key, Value: string): Boolean;
+var
+  p: Integer;
+begin
+  Result := False;
+  p := 1;
+  repeat
+    p := JsonKeyEnd(Part, Key, p);
+    if p = 0 then Exit;
+    if Copy(Part, p, Length(Value) + 2) = '"' + Value + '"' then Exit(True);
+  until False;
 end;
 
 { The object of a JSON answer that holds "Key":"Value" and no other object, as raw bytes: the
@@ -261,7 +307,9 @@ begin
     begin
       Part := Copy(Body, Starts[Depth - 1], p - Starts[Depth - 1] + 1);
       Dec(Depth);
-      if Pos('"' + Key + '":"' + Value + '"', Part) > 0 then
+      { an exact "steamid":"..." missed a player written as "steamid": "...", the way Steam
+        writes it: the name then came from fpjson ("?" on Linux) and the country was lost }
+      if JsonHasPair(Part, Key, Value) then
       begin
         Result := Part;
         Exit;

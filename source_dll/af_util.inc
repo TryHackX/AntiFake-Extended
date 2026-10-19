@@ -155,6 +155,62 @@ begin
   Result := Out;
 end;
 
+{ A text the library keeps (a Steam name) on its way out again. It is in the code page of the
+  console already, and a second Utf8ToConsole broke it: with 1250 the bytes of E-ogonek and
+  Z-dot ($CA $AF) read as one UTF-8 letter that no console has, and "W" + those two came out as
+  "W?". A run of bytes is converted only when it is UTF-8 in its shortest form and comes out as
+  something the console can draw - a name an older version kept as raw UTF-8 is still converted. }
+function KeptToConsole(const S: string): string;
+var
+  i, n, L, k: Integer;
+  B: Byte;
+  CP: LongWord;
+  Ok: Boolean;
+  Seq, C: string;
+begin
+  Result := '';
+  n := Length(S);
+  i := 1;
+  while i <= n do
+  begin
+    B := Byte(S[i]);
+    L := 0;
+    CP := 0;
+    if (B and $E0) = $C0 then begin L := 2; CP := B and $1F; end
+    else if (B and $F0) = $E0 then begin L := 3; CP := B and $0F; end
+    else if (B and $F8) = $F0 then begin L := 4; CP := B and $07; end;
+    Ok := (L > 0) and (i + L - 1 <= n);
+    k := 1;
+    while Ok and (k < L) do
+    begin
+      if (Byte(S[i + k]) and $C0) <> $80 then Ok := False
+      else CP := (CP shl 6) or (Byte(S[i + k]) and $3F);
+      Inc(k);
+    end;
+    { only the shortest form: $C1 $8A (A-acute, S-caron in 1250) is no "J" }
+    if Ok then
+      case L of
+        2: Ok := CP >= $80;
+        3: Ok := CP >= $800;
+      else
+        Ok := CP >= $10000;
+      end;
+    if Ok then
+    begin
+      Seq := Copy(S, i, L);
+      C := Utf8ToConsole(Seq);
+      if C = '?' then C := Seq;
+      Result := Result + C;
+      Inc(i, L);
+    end
+    else
+    begin
+      Result := Result + S[i];
+      Inc(i);
+    end;
+  end;
+end;
+
 { The answer of the lookup comes over plain HTTP, and the country goes out to every player in
   "joined from": a line break or another control character in it (JSON lets \n and \r through as such) is a space here, in the tables of the admins and in the database. }
 procedure SetGeoString(var Buffer: array of Char; const Value: string);

@@ -799,7 +799,7 @@ begin
         end;
         { the dates are written out here: the script has no float to read them with }
         R := string(Profiles[Index].Steam.SteamId) + '|' +
-             FieldText(Utf8ToConsole(string(Profiles[Index].Steam.Persona)), '|') + '|' +
+             FieldText(KeptToConsole(string(Profiles[Index].Steam.Persona)), '|') + '|' +
              string(Profiles[Index].Steam.Country) + '|' +
              Created + '|' + Age + '|' +
              IntToStr(Profiles[Index].Steam.Visible) + '|' +

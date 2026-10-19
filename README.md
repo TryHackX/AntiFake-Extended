@@ -1,4 +1,4 @@
-# AntiFake Extended System Advanced 2.1
+# AntiFake Extended System Advanced 2.1.1
 
 Who is who on a **Soldat Dedicated Server 2.8.2 (Soldat 1.7.1)**: accounts, names, computers,
 addresses, where people play from, what Steam says about them, and which accounts belong to the
@@ -24,7 +24,8 @@ and does not get in its way.
 11. [Every setting](#every-setting)
 12. [Building from source](#building-from-source)
 13. [Troubleshooting](#troubleshooting)
-14. [Changes in 2.1](#changes-in-21)
+14. [Changes in 2.1.1](#changes-in-211)
+15. [Changes in 2.1](#changes-in-21)
 
 ---
 
@@ -94,7 +95,7 @@ password that contains ` ;` itself goes in double quotes (`MysqlPassword` and `S
 lose them; any other value keeps quotes as they are). `SteamApiKey` belongs only in the
 server's own `settings.ini`; never publish it, or the file with it still in there.
 
-At start, the console gets a line like `version 2.1, settings read (N out of range, N
+At start, the console gets a line like `version 2.1.1, settings read (N out of range, N
 unknown)`: how many settings.ini lines were outside their range and kept their default, and
 how many were not recognised.
 
@@ -268,8 +269,9 @@ and the list of accounts that share something with it - only to whom `PlayerMult
 `/multi` about that account: an admin, everybody with `all`, the player about their own account
 with `self`. An admin's list has the accounts with the same names too; a player's comes from the
 Steam accounts, computers and addresses only, so it costs the server one account, not all of
-them. With `PlayerMulti = off` (the default) a player's status says nothing about other
-accounts.
+them, and leaves out what `/multi` leaves out (an address more accounts share than
+`MultiAccountMaxShared`, every address with `MultiAccountByAddress = 0`). With
+`PlayerMulti = off` (the default) a player's status says nothing about other accounts.
 
 **Addresses stay with the admins.** Whatever a player may ask, an address is shown whole only to
 an admin and to the player it belongs to; everybody else sees its first two numbers
@@ -412,7 +414,7 @@ Steam data and the admin decisions, next to the data of ZitroStats. On top of it
 - **While it loads.** Every command except `/antifake` (or `!antifake`) answers "The database
   is still being read; try again in a moment." until the database has been read.
 - **A `/recompile` while people are playing** tells the admins in the game, the console and the
-  log once the database has been read again: `AntiFake Extended 2.1: script compiled, database
+  log once the database has been read again: `AntiFake Extended 2.1.1: script compiled, database
   N accounts loaded in X ms` (or `..., but the database could not be read`).
 - **A journal.** Every `JournalSeconds` (10) whatever changed - logins, play time, visits, what
   Steam said - is appended to `nickreg/antifake.jrn`, so a server that is killed loses seconds instead
@@ -736,6 +738,28 @@ still be wider - a long place, provider or host name - is cut at 98 characters a
 says it was cut there. Lower `ResultsPerPage` if the pages are too long.
 
 ---
+
+## Changes in 2.1.1
+
+Fixes of 2.1, all in the library (`antifake_dll.dll` / `antifake_dll.so`); the script,
+`settings.ini` and the database stay as they are.
+
+- **Steam answers:** 2.1 looked for the entry of a player as `"steamid":"..."` and missed one
+  written with a space after the colon, the way Steam writes its answers: the Steam country of
+  the account stayed empty, and the name came from the JSON library instead (with `?` for every
+  letter outside ASCII on a Linux server without a locale). White space around the colon is
+  now allowed in the Steam answers and in those of ip-api.com.
+- **Steam names:** with `MysqlCodepage = 1250` (the default) a Steam name was kept right but
+  converted once more on its way to the console, and two Polish capitals in a row could come out
+  as one `?` (W, E-ogonek, Z-dot as `W?`; G, O-acute, L-stroke as `G?`) in `/steam`, a status and
+  `Get_Steam_Info`. The kept name now goes out as it is; one an older version kept as raw UTF-8
+  is still converted.
+- **Privacy:** with `PlayerMulti = self` or `all`, a player's `!mystatus` / `!statusa` listed every
+  account of the same address, also an address more accounts share than
+  `MultiAccountMaxShared` (a school, a cafe) and every address with `MultiAccountByAddress = 0`.
+  The list now leaves out what `/multi` leaves out: such addresses, and a computer or Steam
+  account shared by more than `MultiAccountMaxSharedComputer` accounts. The admins' list is as
+  before.
 
 ## Changes in 2.1
 

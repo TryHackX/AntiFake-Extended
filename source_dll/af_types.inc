@@ -83,7 +83,7 @@ const
 
   VISITS_MAGIC = $53545356;   { "VSTS": the visit section at the end of the database }
   DEF_ACTIVE_DAYS = 30;
-  AF_VERSION = '2.1';
+  AF_VERSION = '2.1.1';
   { where the data lives (Engine in settings.ini) }
   ENGINE_BIN = 0;      { local: the file alone }
   ENGINE_MIRROR = 1;   { the file, with a copy of it in the database for a website, read back at

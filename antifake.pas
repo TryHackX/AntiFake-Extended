@@ -1,7 +1,7 @@
 unit Antifake;
 
 { =========================================================================================
-  AntiFake Extended System Advanced 2.1 - the script side.
+  AntiFake Extended System Advanced 2.1.1 - the script side.
 
   Everything that thinks is in antifake_dll: the profiles, the searching, the visits, the
   Steam lookups, the multi-account score, the storage and every table that is drawn.
@@ -160,7 +160,7 @@ external {$IFDEF WIN32} 'Log_Line@scripts/AntiFake-Extended/antifake_dll.dll cde
 implementation
 
 const
-  AF_VERSION = '2.1';
+  AF_VERSION = '2.1.1';
   INI_FILE = 'scripts/AntiFake-Extended/settings.ini';
   DB_FILE_CONST = 'nickreg/antifake.dat';
   CMD_PREFIX = '/';
